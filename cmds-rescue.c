@@ -201,6 +201,87 @@ out:
 	return !!ret;
 }
 
+const char * const cmd_rescue_select_super_usage[] = {
+	"btrfs rescue select-super [options] <device>",
+	"Select backup superblock as primary and replace it. (dangerous)",
+	"",
+	"-s super	 number of superblock backup to be selected (1,2)",
+	NULL
+};
+
+int cmd_rescue_select_super(int argc, char *argv[])
+{
+	struct btrfs_root *root;
+	int ret;
+	u64 num = 0;
+	u64 bytenr = 0;
+
+	optind = 1;
+	while (1) {
+		int c = getopt(argc, argv, "s:");
+
+		if (c < 0)
+			break;
+
+		switch (c) {
+		case 's':
+			num = arg_strtou64(optarg);
+			if (num >= BTRFS_SUPER_MIRROR_MAX) {
+				fprintf(stderr,
+					"ERROR: super mirror should be less than: %d\n",
+					BTRFS_SUPER_MIRROR_MAX);
+				exit(1);
+			}
+			bytenr = btrfs_sb_offset(((int)num));
+			break;
+		default:
+			usage(cmd_rescue_select_super_usage);
+		}
+	}
+	argc = argc - optind;
+
+	if (check_argc_exact(argc, 1))
+		usage(cmd_rescue_select_super_usage);
+
+	if (bytenr == 0) {
+		fprintf(stderr, "Please select the super copy with -s\n");
+		usage(cmd_rescue_select_super_usage);
+	}
+
+	ret = check_mounted(argv[optind]);
+	if (ret < 0) {
+		fprintf(stderr, "Could not check mount status: %s\n", strerror(-ret));
+		return ret;
+	} else if(ret) {
+		fprintf(stderr, "%s is currently mounted. Aborting.\n", argv[optind]);
+		return -EBUSY;
+	}
+
+	root = open_ctree(argv[optind], bytenr, 1);
+	if (!root) {
+		fprintf(stderr, "Open ctree failed\n");
+		return 1;
+	}
+
+	/* make the super writing code think we've read the first super */
+	root->fs_info->super_bytenr = BTRFS_SUPER_INFO_OFFSET;
+	ret = write_all_supers(root);
+
+	if (ret) {
+		fprintf(stderr, "ERROR: cannot write superblocks\n");
+		return 1;
+	}
+
+	/*
+	 * We don't close the ctree or anything, because we don't want a real
+	 * transaction commit.  We just want the super copy we pulled off the
+	 * disk to overwrite all the other copies
+	 */
+	printf("Using SB copy %llu, bytenr %llu and writing to primary\n",
+			(unsigned long long)num, (unsigned long long)bytenr);
+	return ret;
+}
+
 static const char rescue_cmd_group_info[] =
 "toolbox for specific rescue operations";
 
@@ -210,7 +291,10 @@ const struct cmd_group rescue_cmd_group = {
 			cmd_rescue_chunk_recover_usage, NULL, 0},
 		{ "super-recover", cmd_rescue_super_recover,
 			cmd_rescue_super_recover_usage, NULL, 0},
-		{ "zero-log", cmd_rescue_zero_log, cmd_rescue_zero_log_usage, NULL, 0},
+		{ "select-super", cmd_rescue_select_super,
+			cmd_rescue_select_super_usage, NULL, 0},
+		{ "zero-log", cmd_rescue_zero_log,
+			cmd_rescue_zero_log_usage, NULL, 0},
 		NULL_CMD_STRUCT
 	}
 };
