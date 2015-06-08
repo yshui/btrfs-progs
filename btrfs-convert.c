@@ -29,6 +29,7 @@
 #include <uuid/uuid.h>
 #include <linux/limits.h>
 #include <getopt.h>
+#include <limits.h>
 
 #include "ctree.h"
 #include "disk-io.h"
@@ -40,6 +41,8 @@
 #include <ext2fs/ext2_fs.h>
 #include <ext2fs/ext2fs.h>
 #include <ext2fs/ext2_ext_attr.h>
+#include <reiserfs/io.h>
+#include <reiserfs/reiserfs_lib.h>
 
 #define INO_OFFSET (BTRFS_FIRST_FREE_OBJECTID - EXT2_ROOT_INO)
 #define CONV_IMAGE_SUBVOL_OBJECTID BTRFS_FIRST_FREE_OBJECTID
@@ -1103,6 +1106,21 @@ static inline dev_t new_decode_dev(u32 dev)
 	unsigned major = (dev & 0xfff00) >> 8;
 	unsigned minor = (dev & 0xff) | ((dev >> 12) & 0xfff00);
 	return MKDEV(major, minor);
+}
+
+static inline u8 mode_to_file_type(u32 mode)
+{
+	switch (mode & S_IFMT) {
+	case S_IFREG:	return BTRFS_FT_REG_FILE;
+	case S_IFDIR:	return BTRFS_FT_DIR;
+	case S_IFCHR:	return BTRFS_FT_CHRDEV;
+	case S_IFBLK:	return BTRFS_FT_BLKDEV;
+	case S_IFIFO:	return BTRFS_FT_FIFO;
+	case S_IFSOCK:	return BTRFS_FT_SOCK;
+	case S_IFLNK:	return BTRFS_FT_SYMLINK;
+	};
+
+	return BTRFS_FT_UNKNOWN;
 }
 
 static int copy_inode_item(struct btrfs_inode_item *dst,
@@ -2401,8 +2419,1181 @@ static const struct btrfs_convert_operations ext2_convert_ops = {
 	.close_fs		= ext2_close_fs,
 };
 
+struct reiserfs_convert_info {
+	int privroot_found;
+	struct reiserfs_key privroot_key;
+	struct reiserfs_key xattr_key;
+	u32 used_objectids;
+	u32 converted_objectids;
+
+	/* used to track hardlinks */
+	unsigned used_slots;
+	unsigned alloced_slots;
+	u64 *objectids;
+};
+
+static int reiserfs_open_fs(struct btrfs_convert_context *cxt, const char *name)
+{
+	reiserfs_filsys_t fs;
+	int error;
+
+	fs = reiserfs_open(name, O_RDONLY, &error, NULL, 0);
+	if (!fs)
+		return -1;
+
+	error = reiserfs_open_ondisk_bitmap(fs);
+	if (error) {
+		reiserfs_close(fs);
+		return -1;
+	}
+
+	cxt->fs_data = fs;
+	cxt->volume_name = fs->fs_ondisk_sb->s_label;
+	cxt->blocksize = fs->fs_blocksize;
+	cxt->block_count = get_sb_block_count(fs->fs_ondisk_sb);
+	cxt->first_data_block = 0;
+	fs->fs_vp = calloc(1, sizeof(struct reiserfs_convert_info));
+	if (!fs->fs_vp) {
+		reiserfs_close(fs);
+		return -1;
+	}
+
+	return 0;
+}
+
+static int reiserfs_alloc_block(struct btrfs_convert_context *cxt, u64 goal,
+				u64 *block_ret)
+{
+	int ret;
+	reiserfs_filsys_t fs = cxt->fs_data;
+	unsigned long block = goal;
+
+	ret = reiserfs_bitmap_find_zero_bit(fs->fs_bitmap2, &block);
+
+	if (ret != 0)
+		return -1;
+
+	reiserfs_bitmap_set_bit(fs->fs_bitmap2, block);
+
+	*block_ret = block;
+	return 0;
+}
+
+static void bc_reiserfs_free_block(struct btrfs_convert_context *cxt, u64 block)
+{
+	reiserfs_filsys_t fs = cxt->fs_data;
+	reiserfs_bitmap_clear_bit(fs->fs_bitmap2, block);
+}
+
+static int reiserfs_test_block(struct btrfs_convert_context *cxt, u64 block64)
+{
+	reiserfs_filsys_t fs = cxt->fs_data;
+	u32 block = block64;
+
+	BUG_ON(block != block64);
+	return reiserfs_bitmap_test_bit(fs->fs_bitmap2, block);
+}
+
+static void reiserfs_close_fs(struct btrfs_convert_context *cxt)
+{
+	reiserfs_filsys_t fs = cxt->fs_data;
+	struct reiserfs_convert_info *info = fs->fs_vp;
+
+	if (info) {
+		if (info->objectids)
+			free(info->objectids);
+		free(info);
+		fs->fs_vp = NULL;
+	}
+
+	/* We don't want changes to be persistent */
+	fs->fs_bitmap2->bm_dirty = 0;
+
+	reiserfs_close(fs);
+}
+
+static int compare_objectids(const void *p1, const void *p2)
+{
+	u64 v1 = *(u64 *)p1;
+	u64 v2 = *(u64 *)p2;
+
+	if (v1 > v2)
+		return 1;
+	else if (v1 < v2)
+		return -1;
+	return 0;
+}
+
+static int lookup_cached_objectid(reiserfs_filsys_t fs, u64 objectid)
+{
+	struct reiserfs_convert_info *info = fs->fs_vp;
+	u64 *result;
+
+	if (!info->objectids)
+		return 0;
+	result = bsearch(&objectid, info->objectids, info->used_slots,
+			 sizeof(u64), compare_objectids);
+	return result != NULL;
+}
+
+static int insert_cached_objectid(reiserfs_filsys_t fs, u64 objectid)
+{
+	struct reiserfs_convert_info *info = fs->fs_vp;
+
+	if (info->used_slots + 1 >= info->alloced_slots) {
+		u64 *objectids = realloc(info->objectids,
+				    (info->alloced_slots + 1000) * sizeof(u64));
+		if (!objectids)
+			return -ENOMEM;
+		info->objectids = objectids;
+		info->alloced_slots += 1000;
+	}
+	info->objectids[info->used_slots++] = objectid;
+
+	qsort(info->objectids, info->used_slots, sizeof(u64),
+	      compare_objectids);
+	return 0;
+}
+
+static int reiserfs_locate_privroot(reiserfs_filsys_t fs)
+{
+	int err;
+	unsigned generation;
+	struct reiserfs_convert_info *info = fs->fs_vp;
+	struct reiserfs_key key = root_dir_key;
+
+	err = reiserfs_find_entry(fs, &key, ".reiserfs_priv",
+				  &generation, &info->privroot_key);
+	if (err == 1) {
+		info->converted_objectids++;
+		err = reiserfs_find_entry(fs, &info->privroot_key, "xattrs",
+					  &generation, &info->xattr_key);
+		if (err == 1)
+			info->converted_objectids++;
+		else
+			memset(&info->xattr_key, 0, sizeof(info->xattr_key));
+	}
+
+	return 0;
+}
+
+static void reiserfs_copy_inode_item(struct btrfs_inode_item *inode,
+				     struct item_head *ih, void *stat_data)
+{
+	u32 mode;
+	u32 rdev = 0;
+
+	memset(inode, 0, sizeof(*inode));
+	btrfs_set_stack_inode_generation(inode, 1);
+	if (get_ih_key_format(ih) == KEY_FORMAT_1) {
+		struct stat_data_v1 *sd = stat_data;
+
+		mode = sd_v1_mode(sd);
+		btrfs_set_stack_inode_size(inode, sd_v1_size(sd));
+		btrfs_set_stack_inode_nlink(inode, sd_v1_nlink(sd));
+		btrfs_set_stack_inode_uid(inode, sd_v1_uid(sd));
+		btrfs_set_stack_inode_gid(inode, sd_v1_gid(sd));
+		btrfs_set_stack_timespec_sec(&inode->atime, sd_v1_atime(sd));
+		btrfs_set_stack_timespec_sec(&inode->ctime, sd_v1_ctime(sd));
+		btrfs_set_stack_timespec_sec(&inode->mtime, sd_v1_mtime(sd));
+
+		if (!S_ISREG(mode) && !S_ISDIR(mode) && !S_ISLNK(mode))
+			rdev = new_decode_dev(sd_v1_rdev(sd));
+	} else {
+		struct stat_data *sd = stat_data;
+
+		mode = sd_v2_mode(sd);
+		btrfs_set_stack_inode_size(inode, sd_v2_size(sd));
+		btrfs_set_stack_inode_nlink(inode, sd_v2_nlink(sd));
+		btrfs_set_stack_inode_uid(inode, sd_v2_uid(sd));
+		btrfs_set_stack_inode_gid(inode, sd_v2_gid(sd));
+		btrfs_set_stack_timespec_sec(&inode->atime, sd_v2_atime(sd));
+		btrfs_set_stack_timespec_sec(&inode->ctime, sd_v2_ctime(sd));
+		btrfs_set_stack_timespec_sec(&inode->mtime, sd_v2_mtime(sd));
+
+		if (!S_ISREG(mode) && !S_ISDIR(mode) && !S_ISLNK(mode))
+			rdev = new_decode_dev(sd_v2_rdev(sd));
+	}
+	if (S_ISDIR(mode)) {
+		btrfs_set_stack_inode_size(inode, 0);
+		btrfs_set_stack_inode_nlink(inode, 1);
+	}
+	btrfs_set_stack_inode_mode(inode, mode);
+	btrfs_set_stack_inode_rdev(inode, rdev);
+}
+
+/* This should move to libreiserfscore */
+typedef int (*iterate_indirect_fn)(reiserfs_filsys_t fs, u64 position,
+				   u64 size, int num_blocks,
+				   u32 *blocks, void *data);
+typedef int (*iterate_direct_fn)(reiserfs_filsys_t fs, u64 position,
+				 u64 size, char *body,
+				 size_t len, void *data);
+
+static int reiserfs_iterate_file_data(reiserfs_filsys_t fs,
+			      const struct reiserfs_key const *short_key,
+			      iterate_indirect_fn indirect_fn,
+			      iterate_direct_fn direct_fn,
+			      void *data)
+{
+	INITIALIZE_REISERFS_PATH(path);
+	struct reiserfs_key key = {
+		.k2_dir_id = short_key->k2_dir_id,
+		.k2_objectid = short_key->k2_objectid,
+	};
+	struct item_head *ih;
+	u64 size;
+	u64 position = 0;
+	int ret;
+
+	set_key_type_v2(&key, TYPE_STAT_DATA);
+	set_key_offset_v2(&key, 0);
+
+	ret = reiserfs_search_by_key_3(fs, &key, &path);
+	if (ret != ITEM_FOUND) {
+		ret = -ENOENT;
+		goto fail;
+	}
+
+	ih = tp_item_head(&path);
+	if (!is_stat_data_ih(ih)) {
+		ret = -EINVAL;
+		goto fail;
+	}
+
+	if (get_ih_key_format(ih) == KEY_FORMAT_1) {
+		struct stat_data_v1 *sd = tp_item_body(&path);
+		size = sd_v1_size(sd);
+	} else {
+		struct stat_data *sd = tp_item_body(&path);
+		size = sd_v2_size(sd);
+	}
+
+	pathrelse(&path);
+
+	set_key_offset_v2(&key, 1);
+	set_key_type_v2(&key, TYPE_DIRECT);
+
+	while (position < size) {
+		struct item_head *ih = tp_item_head(&path);
+		u64 offset;
+
+		ret = reiserfs_search_by_position(fs, &key, 0, &path);
+		ih = tp_item_head(&path);
+		if (ret != POSITION_FOUND) {
+			reiserfs_warning(stderr,
+				"found %k instead of %k [%d] (%lu, %lu)\n",
+				&ih->ih_key, &key, ret, position, size);
+			if (ret != ITEM_NOT_FOUND)
+				ret = -EIO;
+			goto fail;
+		}
+
+		offset = get_offset(&ih->ih_key);
+
+		position = offset - 1;
+
+		if (is_indirect_key(&ih->ih_key)) {
+			int num_ptrs = get_ih_item_len(ih) / 4;
+			u32 *ptrs = tp_item_body(&path);
+
+			BUG_ON(!num_ptrs);
+			ret = indirect_fn(fs, position, size, num_ptrs,
+					  ptrs, data);
+			if (ret)
+				goto fail;
+			position += num_ptrs * fs->fs_blocksize;
+		} else if (is_direct_key(&ih->ih_key)) {
+			int len = get_ih_item_len(ih);
+
+			ret = direct_fn(fs, position, size, tp_item_body(&path),
+					len, data);
+			if (ret)
+				goto fail;
+			position += len;
+		} else
+			break;
+		pathrelse(&path);
+		set_key_offset_v2(&key, position + 1);
+	}
+
+	ret = 0;
+
+fail:
+	pathrelse(&path);
+	return ret;
+}
+
+struct reiserfs_blk_iterate_data {
+	struct blk_iterate_data blk_data;
+	int indirect;
+	char *inline_data;
+	u64 inline_offset;
+	u32 inline_length;
+};
+
+static void init_reiserfs_blk_iterate_data(
+				struct reiserfs_blk_iterate_data *data,
+				struct btrfs_trans_handle *trans,
+				struct btrfs_root *root,
+				struct btrfs_inode_item *inode,
+				u64 objectid, int checksum)
+{
+	init_blk_iterate_data(&data->blk_data, trans, root, inode, objectid,
+			      checksum);
+	data->indirect = 0;
+	data->inline_data = NULL;
+	data->inline_offset = (u64)-1;
+	data->inline_length = 0;
+}
+
+static int reiserfs_record_indirect_extent(reiserfs_filsys_t fs, u64 position,
+					   u64 size, int num_ptrs,
+					   u32 *ptrs, void *data)
+{
+	struct reiserfs_blk_iterate_data *bdata = data;
+	u32 file_block = position / fs->fs_blocksize;
+	int i;
+	int ret = 0;
+
+	bdata->indirect = 1;
+
+	for (i = 0; i < num_ptrs; i++) {
+		u32 block = d32_get(ptrs, i);
+
+		ret = block_iterate_proc(block, file_block++, &bdata->blk_data);
+		if (ret)
+			break;
+	}
+
+	return ret;
+}
+
+static int reiserfs_record_direct_extent(reiserfs_filsys_t fs, u64 position,
+					 u64 size, char *body,
+					 size_t len, void *data)
+{
+	struct reiserfs_blk_iterate_data *bdata = data;
+	char *inline_data;
+
+	if (bdata->inline_offset == (u64)-1)
+		bdata->inline_offset = position;
+
+	inline_data = realloc(bdata->inline_data, bdata->inline_length + len);
+	if (!inline_data)
+		return -ENOMEM;
+	bdata->inline_data = inline_data;
+
+	memcpy(bdata->inline_data + bdata->inline_length, body, len);
+	bdata->inline_length += len;
+
+	return 0;
+}
+
+static int convert_direct(struct btrfs_trans_handle *trans,
+			  struct btrfs_root *root, u64 objectid,
+			  struct btrfs_inode_item *inode, const char *body,
+			  u32 length, u64 offset, int checksum)
+{
+	struct btrfs_key key;
+	u32 sectorsize = root->sectorsize;
+	int ret;
+	struct extent_buffer *eb;
+
+	BUG_ON(length > sectorsize);
+	ret = custom_alloc_extent(root, sectorsize, 0, &key, 0);
+	if (ret)
+		return ret;
+
+	eb = btrfs_find_create_tree_block(root->fs_info->extent_root,
+					  key.objectid, sectorsize);
+	if (!eb)
+		return -ENOMEM;
+
+	write_extent_buffer(eb, body, 0, length);
+	ret = write_and_map_eb(trans, root, eb);
+	free_extent_buffer(eb);
+	if (ret)
+		return ret;
+
+	ret = btrfs_record_file_extent(trans, root, objectid,
+				       inode, offset, key.objectid,
+				       sectorsize);
+	if (ret || !checksum)
+		return ret;
+
+	return csum_disk_extent(trans, root, key.objectid, sectorsize);
+}
+
+static int reiserfs_record_file_extents(reiserfs_filsys_t fs,
+					struct btrfs_trans_handle *trans,
+					struct btrfs_root *root,
+					u64 objectid,
+					struct btrfs_inode_item *inode,
+					struct reiserfs_key *sd_key,
+					int datacsum)
+
+{
+	int ret;
+	struct reiserfs_blk_iterate_data data;
+	init_reiserfs_blk_iterate_data(&data, trans, root, inode,
+				       objectid, datacsum);
+
+	ret = reiserfs_iterate_file_data(fs, sd_key,
+					 reiserfs_record_indirect_extent,
+					 reiserfs_record_direct_extent, &data);
+	if (ret)
+		return ret;
+
+	if (data.indirect && data.blk_data.num_blocks) {
+		ret = record_file_blocks(&data.blk_data,
+					 data.blk_data.first_block,
+					 data.blk_data.disk_block,
+					 data.blk_data.num_blocks);
+		if (ret)
+			goto fail;
+	}
+	if (data.inline_length) {
+		if (data.inline_length < BTRFS_MAX_INLINE_DATA_SIZE(root)) {
+			int isize;
+			ret = btrfs_insert_inline_extent(trans, root,
+							 objectid,
+							 data.inline_offset,
+							 data.inline_data,
+							 data.inline_length);
+			if (ret)
+				goto fail;
+
+			isize = btrfs_stack_inode_nbytes(inode);
+			btrfs_set_stack_inode_nbytes(inode,
+					     isize + data.inline_length);
+		} else {
+			ret = convert_direct(trans, root, objectid, inode,
+					     data.inline_data,
+					     data.inline_length,
+					     data.inline_offset, datacsum);
+			if (ret)
+				goto fail;
+		}
+	}
+
+	ret = 0;
+fail:
+	return ret;
+}
+
+#define OID_OFFSET (BTRFS_FIRST_FREE_OBJECTID - REISERFS_ROOT_OBJECTID)
+static int reiserfs_copy_meta(reiserfs_filsys_t fs, struct btrfs_root *root,
+			      int datacsum, u32 deh_dirid, u32 deh_objectid,
+			      u8 *type);
+
+struct reiserfs_dirent_data {
+	u64 index;
+	int datacsum;
+	struct btrfs_inode_item *inode;
+	struct btrfs_root *root;
+};
+
+static int reiserfs_copy_dirent(reiserfs_filsys_t fs,
+				const char *name, size_t len,
+				u64 dir_objectid,
+				u64 deh_dirid, u64 deh_objectid, void *cb_data)
+{
+	int ret;
+	u8 type;
+	struct btrfs_trans_handle *trans;
+	u64 objectid = deh_objectid + OID_OFFSET;
+	struct reiserfs_dirent_data *dirent_data = cb_data;
+	struct btrfs_root *root = dirent_data->root;
+
+	ret = reiserfs_copy_meta(fs, root, dirent_data->datacsum,
+				 deh_dirid, deh_objectid, &type);
+	if (ret)
+		return ret;
+	trans = btrfs_start_transaction(root, 1);
+	if (!trans)
+		return -ENOMEM;
+
+	ret = convert_insert_dirent(trans, root, name, len, dir_objectid,
+				    objectid, type, dirent_data->index++,
+				    dirent_data->inode);
+	return btrfs_commit_transaction(trans, root);
+}
+
+typedef int (*reiserfs_iterate_dir_fn)(reiserfs_filsys_t fs,
+				       const char *name, size_t len,
+				       u64 dir_objectid,
+				       u64 deh_dirid, u64 deh_objectid,
+				       void *cb_data);
+
+static int reiserfs_iterate_dir(reiserfs_filsys_t fs,
+				struct reiserfs_key *dir_key,
+				reiserfs_iterate_dir_fn callback, void *cb_data)
+
+{
+	INITIALIZE_REISERFS_PATH(path);
+	struct reiserfs_key *next_key;
+	struct reiserfs_convert_info *info = fs->fs_vp;
+	struct reiserfs_key min_key = {};
+	struct reiserfs_de_head *deh;
+	struct reiserfs_key next_item_key;
+	int ret;
+	u64 next_pos = DOT_OFFSET;
+
+	set_key_dirid(&next_item_key, get_key_dirid(dir_key));
+	set_key_objectid(&next_item_key, get_key_objectid(dir_key));
+	set_key_offset_v1(&next_item_key, DOT_OFFSET);
+	set_key_uniqueness(&next_item_key, DIRENTRY_UNIQUENESS);
+
+	while (1) {
+		u32 pos;
+		int i;
+		struct item_head *ih;
+		ret = reiserfs_search_by_entry_key(fs, &next_item_key, &path);
+		if (ret != POSITION_FOUND) {
+			reiserfs_warning(stderr,
+				"search by entry key for %k: %d\n",
+				&next_item_key, ret);
+			break;
+	       }
+
+		ret = 0;
+
+		ih = tp_item_head(&path);
+		deh = tp_item_body(&path);
+		pos = path.pos_in_item;
+
+		deh += pos;
+		for (i = pos; i < get_ih_entry_count(ih); i++, deh++) {
+			const char *name;
+			size_t name_len;
+			if (get_deh_offset(deh) == DOT_OFFSET ||
+			    get_deh_offset(deh) == DOT_DOT_OFFSET)
+				continue;
+
+			/* There will only be one of these */
+			if (info->privroot_key.k2_objectid &&
+			    !info->privroot_found &&
+			    info->privroot_key.k2_dir_id == deh->deh2_dir_id &&
+			    info->privroot_key.k2_objectid ==
+				deh->deh2_objectid) {
+				info->privroot_found = 1;
+				continue;
+			}
+
+			name = tp_item_body(&path) + get_deh_location(deh);
+			name_len = entry_length(ih, deh, i);
+			if (!name[name_len - 1])
+				name_len = strlen(name);
+
+			ret = callback(fs, name, name_len,
+				       get_key_objectid(dir_key) + OID_OFFSET,
+				       get_deh_dirid(deh),
+				       get_deh_objectid(deh), cb_data);
+			if (ret)
+				goto fail;
+
+			next_pos = get_deh_offset(deh) + 1;
+		}
+
+		next_key = uget_rkey(&path);
+		if (!next_key)
+			break;
+		if (!comp_keys(next_key, &min_key)) {
+			set_key_offset_v2(&next_item_key, next_pos);
+			pathrelse(&path);
+			continue;
+		}
+
+		if (comp_short_keys(next_key, &next_item_key))
+			break;
+
+		next_item_key = *next_key;
+		pathrelse(&path);
+	}
+fail:
+	pathrelse(&path);
+	return ret;
+}
+
+static int reiserfs_copy_symlink(struct btrfs_trans_handle *trans,
+				 struct btrfs_root *root, u64 objectid,
+				 struct btrfs_inode_item *btrfs_inode,
+				 reiserfs_filsys_t fs,
+				 struct reiserfs_path *sd_path)
+{
+	INITIALIZE_REISERFS_PATH(path);
+	struct item_head *ih = tp_item_head(sd_path);
+	struct reiserfs_key key = ih->ih_key;
+	int ret;
+	const char *symlink;
+	int len;
+
+	set_key_uniqueness(&key, type2uniqueness(TYPE_DIRECT));
+	set_key_offset_v1(&key, 1);
+
+	ret = reiserfs_search_by_key_3(fs, &key, &path);
+	if (ret != ITEM_FOUND) {
+		ret = -ENOENT;
+		goto fail;
+	}
+
+	symlink = tp_item_body(&path);
+	len = get_ih_item_len(tp_item_head(&path));
+
+	ret = btrfs_insert_inline_extent(trans, root, objectid, 0,
+					 symlink, len + 1);
+	btrfs_set_stack_inode_nbytes(btrfs_inode, len + 1);
+fail:
+	pathrelse(&path);
+	return ret;
+}
+
+static int reiserfs_copy_meta(reiserfs_filsys_t fs, struct btrfs_root *root,
+			      int datacsum, u32 deh_dirid, u32 deh_objectid,
+			      u8 *type)
+{
+	INITIALIZE_REISERFS_PATH(path);
+	int ret = 0;
+	struct item_head *ih;
+	struct reiserfs_key key;
+	struct btrfs_inode_item btrfs_inode;
+	struct btrfs_trans_handle *trans = NULL;
+	struct reiserfs_convert_info *info = fs->fs_vp;
+	u32 mode;
+	u64 objectid = deh_objectid + OID_OFFSET;
+	struct reiserfs_dirent_data dirent_data = {
+		.index = 2,
+		.datacsum = datacsum,
+		.inode = &btrfs_inode,
+		.root = root,
+	};
+
+	set_key_dirid(&key, deh_dirid);
+	set_key_objectid(&key, deh_objectid);
+	set_key_offset_v2(&key, 0);
+	set_key_type_v2(&key, TYPE_STAT_DATA);
+
+	ret = reiserfs_search_by_key_3(fs, &key, &path);
+	if (ret != ITEM_FOUND) {
+		ret = -ENOENT;
+		goto fail;
+	}
+
+	ih = tp_item_head(&path);
+	if (!is_stat_data_ih(ih)) {
+		ret = -EINVAL;
+		goto fail;
+	}
+
+	reiserfs_copy_inode_item(&btrfs_inode, ih, tp_item_body(&path));
+	mode = btrfs_stack_inode_mode(&btrfs_inode);
+	*type = mode_to_file_type(mode);
+
+	/* Inodes with hardlinks should only be inserted once */
+	if (S_ISREG(mode) && btrfs_stack_inode_nlink(&btrfs_inode) > 1) {
+		if (lookup_cached_objectid(fs, deh_objectid)) {
+			ret = 0;
+			goto fail; /* Not a failure */
+		}
+		ret = insert_cached_objectid(fs, deh_objectid);
+		if (ret)
+			goto fail;
+	}
+
+	switch (mode & S_IFMT) {
+	case S_IFREG:
+		trans = btrfs_start_transaction(root, 1);
+		if (!trans) {
+			ret = -ENOMEM;
+			goto fail;
+		}
+		ret = reiserfs_record_file_extents(fs, trans, root, objectid,
+						   &btrfs_inode, &ih->ih_key,
+						   datacsum);
+		if (ret)
+			goto fail;
+		break;
+	case S_IFDIR:
+		ret = reiserfs_iterate_dir(fs, &ih->ih_key,
+					   reiserfs_copy_dirent, &dirent_data);
+		if (ret)
+			goto fail;
+		trans = btrfs_start_transaction(root, 1);
+		if (!trans) {
+			ret = -ENOMEM;
+			goto fail;
+		}
+		ret = btrfs_insert_inode_ref(trans, root, "..", 2,
+					     objectid, objectid, 0);
+		break;
+	case S_IFLNK:
+		trans = btrfs_start_transaction(root, 1);
+		if (!trans) {
+			ret = -ENOMEM;
+			goto fail;
+		}
+		ret = reiserfs_copy_symlink(trans, root, objectid,
+					    &btrfs_inode, fs, &path);
+		if (ret)
+			goto fail;
+		break;
+	default:
+		trans = btrfs_start_transaction(root, 1);
+		if (!trans) {
+			ret = -ENOMEM;
+			goto fail;
+		}
+	}
+
+	ret = btrfs_insert_inode(trans, root, objectid, &btrfs_inode);
+	if (ret)
+		goto fail;
+	ret = btrfs_commit_transaction(trans, root);
+
+	if ((++info->converted_objectids % 10000) == 0)
+		printf("%d objectids converted.\n", info->converted_objectids);
+fail:
+	pathrelse(&path);
+	return ret;
+}
+
+static void reiserfs_count_objectids(reiserfs_filsys_t fs)
+{
+	struct reiserfs_convert_info *info = fs->fs_vp;
+	struct reiserfs_super_block *sb = fs->fs_ondisk_sb;
+	u32 count = 0;
+	u32 *map;
+	int i;
+
+	if (fs->fs_format == REISERFS_FORMAT_3_6)
+		map = (u32 *) (sb + 1);
+	else
+		map = (u32 *)((struct reiserfs_super_block_v1 *)sb + 1);
+
+	for (i = 0; i < get_sb_oid_cursize(sb); i += 2)
+		count += le32_to_cpu(map[i + 1]) - (le32_to_cpu(map[i]) + 1);
+
+	info->used_objectids = count;
+	printf("file system contains %u objectids (including extended attributes)\n",
+	       info->used_objectids);
+
+}
+struct reiserfs_xattr_data {
+	struct btrfs_root *root;
+	struct btrfs_trans_handle *trans;
+	u64 target_oid;
+	const char *name;
+	size_t namelen;
+	void *body;
+	size_t len;
+};
+
+static int reiserfs_xattr_indirect_fn(reiserfs_filsys_t fs, u64 position,
+				      u64 size, int num_blocks,
+				      u32 *blocks, void *data)
+{
+	int i;
+	struct reiserfs_xattr_data *xa_data = data;
+	size_t alloc = min(position + num_blocks * fs->fs_blocksize, size);
+	char *body;
+
+	if (size > BTRFS_LEAF_DATA_SIZE(xa_data->root) -
+	    sizeof(struct btrfs_item) - sizeof(struct btrfs_dir_item)) {
+		fprintf(stderr, "skip large xattr on objectid %llu name %.*s\n",
+			xa_data->target_oid, (int)xa_data->namelen,
+			xa_data->name);
+		return -E2BIG;
+	}
+
+	body = realloc(xa_data->body, alloc);
+	if (!body)
+		return -ENOMEM;
+
+	xa_data->body = body;
+	xa_data->len = alloc;
+
+	for (i = 0; i < num_blocks; i++) {
+		int ret;
+		u32 block = d32_get(blocks, i);
+		u64 offset = (u64)block * fs->fs_blocksize;
+		size_t chunk = min_t(u64, size - position, fs->fs_blocksize);
+		char *buffer = xa_data->body + position;
+		ret = read_disk_extent(xa_data->root, offset, chunk, buffer);
+		if (ret)
+			return ret;
+		position += chunk;
+	}
+
+	return 0;
+}
+
+static int reiserfs_xattr_direct_fn(reiserfs_filsys_t fs, u64 position,
+				    u64 size, char *body, size_t len,
+				    void *data)
+{
+	struct reiserfs_xattr_data *xa_data = data;
+	char *newbody;
+
+	if (size > BTRFS_LEAF_DATA_SIZE(xa_data->root) -
+	    sizeof(struct btrfs_item) - sizeof(struct btrfs_dir_item)) {
+		fprintf(stderr, "skip large xattr on objectid %llu name %.*s\n",
+			xa_data->target_oid, (int)xa_data->namelen,
+			xa_data->name);
+		return -E2BIG;
+	}
+
+	newbody = realloc(xa_data->body, position + len);
+	if (!newbody)
+		return -ENOMEM;
+	xa_data->body = newbody;
+	xa_data->len = position + len;
+	memcpy(xa_data->body + position, data, len);
+	return 0;
+}
+
+/* All this *should* be in reiserfscore */
+#ifndef REISERFS_XATTR_MAGIC
+/* Magic value in header */
+#define REISERFS_XATTR_MAGIC 0x52465841 /* "RFXA" */
+
+struct reiserfs_xattr_header {
+	__le32 h_magic;		/* magic number for identification */
+	__le32 h_hash;		/* hash of the value */
+};
+
+static inline unsigned short from32to16(unsigned int x)
+{
+	/* add up 16-bit and 16-bit for 16+c bit */
+	x = (x & 0xffff) + (x >> 16);
+	/* add up carry.. */
+	x = (x & 0xffff) + (x >> 16);
+	return x;
+}
+
+static unsigned int do_csum(const unsigned char *buff, int len)
+{
+	int odd;
+	unsigned int result = 0;
+
+	if (len <= 0)
+		goto out;
+	odd = 1 & (unsigned long) buff;
+	if (odd) {
+#ifdef __LITTLE_ENDIAN
+		result += (*buff << 8);
+#else
+		result = *buff;
+#endif
+		len--;
+		buff++;
+	}
+	if (len >= 2) {
+		if (2 & (unsigned long) buff) {
+			result += *(unsigned short *) buff;
+			len -= 2;
+			buff += 2;
+		}
+		if (len >= 4) {
+			const unsigned char *end = buff + ((unsigned)len & ~3);
+			unsigned int carry = 0;
+			do {
+				unsigned int w = *(unsigned int *) buff;
+				buff += 4;
+				result += carry;
+				result += w;
+				carry = (w > result);
+			} while (buff < end);
+			result += carry;
+			result = (result & 0xffff) + (result >> 16);
+		}
+		if (len & 2) {
+			result += *(unsigned short *) buff;
+			buff += 2;
+		}
+	}
+	if (len & 1)
+#ifdef __LITTLE_ENDIAN
+		result += *buff;
+#else
+		result += (*buff << 8);
+#endif
+	result = from32to16(result);
+	if (odd)
+		result = ((result >> 8) & 0xff) | ((result & 0xff) << 8);
+out:
+	return result;
+}
+
+__wsum csum_partial(const void *buff, int len, __wsum wsum)
+{
+	unsigned int sum = (__force unsigned int)wsum;
+	unsigned int result = do_csum(buff, len);
+
+	/* add in old sum, and carry.. */
+	result += sum;
+	if (sum > result)
+		result += 1;
+	return (__force __wsum)result;
+}
+
+static inline __u32 reiserfs_xattr_hash(const char *msg, int len)
+{
+	return csum_partial(msg, len, 0);
+}
+
+static int reiserfs_check_xattr(const void *body, int len)
+{
+	const struct reiserfs_xattr_header *xah = body;
+	u32 hash = reiserfs_xattr_hash(body + 8, len - 8);
+
+	return xah->h_magic == cpu_to_le32(REISERFS_XATTR_MAGIC) &&
+	       le32_to_cpu(xah->h_hash) == hash;
+}
+
+#define REISERFS_ACL_VERSION 0x0001
+
+struct reiserfs_acl_entry {
+	__le16		e_tag;
+	__le16		e_perm;
+	__le32		e_id;
+};
+
+struct reiserfs_acl_entry_short {
+	__le16		e_tag;
+	__le16		e_perm;
+};
+
+struct reiserfs_acl_header {
+	__le32		a_version;
+};
+
+static inline int reiserfs_acl_count(size_t size)
+{
+	ssize_t s;
+
+	size -= sizeof(struct reiserfs_acl_header);
+	s = size - 4 * sizeof(struct reiserfs_acl_entry_short);
+	if (s < 0) {
+		if (size % sizeof(struct reiserfs_acl_entry_short))
+			return -1;
+		return size / sizeof(struct reiserfs_acl_entry_short);
+	} else {
+		if (s % sizeof(struct reiserfs_acl_entry))
+			return -1;
+		return s / sizeof(struct reiserfs_acl_entry) + 4;
+	}
+}
+
+
+static int reiserfs_acl_to_xattr(void *dst, const void *src,
+				 size_t dst_size, size_t src_size)
+{
+	int i, count;
+	const void *end = src + src_size;
+	acl_ea_header *ext_acl = (acl_ea_header *)dst;
+	acl_ea_entry *dst_entry = ext_acl->a_entries;
+	struct reiserfs_acl_entry *src_entry;
+
+	if (src_size < sizeof(struct reiserfs_acl_header))
+		goto fail;
+	if (((struct reiserfs_acl_header *)src)->a_version !=
+	    cpu_to_le32(REISERFS_ACL_VERSION))
+		goto fail;
+	src += sizeof(struct reiserfs_acl_header);
+	count = reiserfs_acl_count(src_size);
+	if (count <= 0)
+		goto fail;
+
+	BUG_ON(dst_size < acl_ea_size(count));
+	ext_acl->a_version = cpu_to_le32(ACL_EA_VERSION);
+	for (i = 0; i < count; i++, dst_entry++) {
+		src_entry = (struct reiserfs_acl_entry *)src;
+		if (src + sizeof(struct reiserfs_acl_entry_short) > end)
+			goto fail;
+		dst_entry->e_tag = src_entry->e_tag;
+		dst_entry->e_perm = src_entry->e_perm;
+		switch (le16_to_cpu(src_entry->e_tag)) {
+		case ACL_USER_OBJ:
+		case ACL_GROUP_OBJ:
+		case ACL_MASK:
+		case ACL_OTHER:
+			src += sizeof(struct reiserfs_acl_entry_short);
+			dst_entry->e_id = cpu_to_le32(ACL_UNDEFINED_ID);
+			break;
+		case ACL_USER:
+		case ACL_GROUP:
+			src += sizeof(struct reiserfs_acl_entry);
+			if (src > end)
+				goto fail;
+			dst_entry->e_id = src_entry->e_id;
+			break;
+		default:
+			goto fail;
+		}
+	}
+	if (src != end)
+		goto fail;
+	return 0;
+fail:
+	return -EINVAL;
+}
+#endif
+
+static int reiserfs_copy_one_xattr(reiserfs_filsys_t fs,
+				   const char *name, size_t namelen,
+				   u64 dir_objectid, u64 deh_dirid,
+				   u64 deh_objectid, void *cb_data)
+{
+	int ret;
+	struct reiserfs_convert_info *info = fs->fs_vp;
+	struct reiserfs_xattr_data *xa_data = cb_data;
+	struct reiserfs_key key = {
+		.k2_dir_id = deh_dirid,
+		.k2_objectid = deh_objectid,
+	};
+	void *body = NULL;
+	int len;
+
+	xa_data->name = name;
+	xa_data->namelen = namelen;
+
+	ret = reiserfs_iterate_file_data(fs, &key, reiserfs_xattr_indirect_fn,
+					 reiserfs_xattr_direct_fn, cb_data);
+	if (ret)
+		goto out;
+
+	ret = reiserfs_check_xattr(xa_data->body, xa_data->len);
+	if (ret) {
+		fprintf(stderr,
+			"skip corrupted xattr on objectid %llu name %.*s\n",
+		xa_data->target_oid, (int)xa_data->namelen,
+		xa_data->name);
+		goto out;
+	}
+
+	body = xa_data->body + sizeof(struct reiserfs_xattr_header);
+	len = xa_data->len - sizeof(struct reiserfs_xattr_header);
+
+	if (!strncmp("system.posix_acl_default", name, namelen) ||
+	    !strncmp("system.posix_acl_access", name, namelen)) {
+		size_t bufsize = acl_ea_size(ext2_acl_count(len));
+		char *databuf = malloc(bufsize);
+		if (!databuf)
+			goto out;
+		ret = reiserfs_acl_to_xattr(databuf, body, bufsize, len);
+		if (ret)
+			goto out;
+		body = databuf;
+		len = bufsize;
+	}
+
+	ret = btrfs_insert_xattr_item(xa_data->trans, xa_data->root,
+				      name, namelen, body, len,
+				      xa_data->target_oid);
+
+	if ((++info->converted_objectids % 10000) == 0)
+		printf("%d objectids converted.\n", info->converted_objectids);
+out:
+	if (body &&
+	    body != xa_data->body + sizeof(struct reiserfs_xattr_header))
+		free(body);
+	if (xa_data->body)
+		free(xa_data->body);
+	xa_data->body = NULL;
+	xa_data->len = 0;
+
+	return ret;
+}
+
+static int reiserfs_copy_xattr_dir(reiserfs_filsys_t fs,
+				   const char *name, size_t len,
+				   u64 dir_objectid, u64 deh_dirid,
+				   u64 deh_objectid, void *cb_data)
+{
+	struct reiserfs_convert_info *info = fs->fs_vp;
+	struct reiserfs_xattr_data *xa_data = cb_data;
+	struct reiserfs_key dir_key = {
+		.k2_dir_id = deh_dirid,
+		.k2_objectid = deh_objectid,
+	};
+	int ret, err;
+
+	errno = 0;
+	xa_data->target_oid = strtoull(name, NULL, 16);
+	if (xa_data->target_oid == ULLONG_MAX && errno)
+		return -errno;
+
+	xa_data->target_oid += OID_OFFSET;
+
+	xa_data->trans = btrfs_start_transaction(xa_data->root, 1);
+	if (!xa_data->trans)
+		return -ENOMEM;
+
+	ret = reiserfs_iterate_dir(fs, &dir_key,
+				    reiserfs_copy_one_xattr, xa_data);
+
+	if ((++info->converted_objectids % 10000) == 0)
+		printf("%d objectids converted.\n", info->converted_objectids);
+	err = btrfs_commit_transaction(xa_data->trans, xa_data->root);
+	xa_data->trans = NULL;
+	return ret ?: err;
+}
+
+static int reiserfs_copy_xattrs(reiserfs_filsys_t fs, struct btrfs_root *root)
+{
+	struct reiserfs_convert_info *info = fs->fs_vp;
+	struct reiserfs_xattr_data data = {
+		.root = root,
+	};
+
+	if (info->xattr_key.k2_objectid == 0)
+		return 0;
+
+	return reiserfs_iterate_dir(fs, &info->xattr_key,
+				    reiserfs_copy_xattr_dir, &data);
+}
+
+static int reiserfs_copy_inodes(struct btrfs_convert_context *cxt,
+				struct btrfs_root *root,
+				int datacsum, int packing, int noxattr,
+				struct task_ctx *p)
+{
+	reiserfs_filsys_t fs = cxt->fs_data;
+	struct reiserfs_convert_info *info = fs->fs_vp;
+	int ret;
+	u8 type;
+
+	reiserfs_count_objectids(fs);
+
+	ret = reiserfs_locate_privroot(fs);
+	if (ret)
+		return ret;
+
+	ret = reiserfs_copy_meta(fs, root, datacsum,
+				 REISERFS_ROOT_PARENT_OBJECTID,
+				 REISERFS_ROOT_OBJECTID, &type);
+	if (ret || noxattr)
+		return ret;
+
+	ret = reiserfs_copy_xattrs(fs, root);
+	printf("%d objectids converted.\n", info->converted_objectids);
+	return ret;
+}
+
+static struct btrfs_convert_operations reiserfs_convert_ops = {
+	.name		= "reiserfs",
+	.open_fs	= reiserfs_open_fs,
+	.alloc_block	= reiserfs_alloc_block,
+	.copy_inodes	= reiserfs_copy_inodes,
+	.test_block	= reiserfs_test_block,
+	.free_block	= bc_reiserfs_free_block,
+	.close_fs	= reiserfs_close_fs,
+};
+
 static const struct btrfs_convert_operations *convert_operations[] = {
 	&ext2_convert_ops,
+	&reiserfs_convert_ops,
 };
 
 static int convert_open_fs(const char *devname,
