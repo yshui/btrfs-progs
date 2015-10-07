@@ -33,14 +33,12 @@ MAN8_TXT += btrfs-property.asciidoc
 
 # Mount manpage
 MAN5_TXT += btrfs-mount.asciidoc
-MAN3_TXT += btrfs-ioctl.asciidoc
 
-MAN_TXT = $(MAN8_TXT) $(MAN5_TXT)
-MAN_XML = $(patsubst %.asciidoc,%.xml,$(MAN_TXT))
-MAN_HTML = $(patsubst %.asciidoc,%.html,$(MAN_TXT))
+MAN3_TXT += btrfs-ioctl.asciidoc
 
 MAN_TXT = $(MAN3_TXT) $(MAN8_TXT) $(MAN5_TXT)
 MAN_XML = $(patsubst %.asciidoc,%.xml,$(MAN_TXT))
+MAN_HTML = $(patsubst %.asciidoc,%.html,$(MAN_TXT))
 GZ_MAN3 = $(patsubst %.asciidoc,%.3.gz,$(MAN3_TXT))
 GZ_MAN5 = $(patsubst %.asciidoc,%.5.gz,$(MAN5_TXT))
 GZ_MAN8 = $(patsubst %.asciidoc,%.8.gz,$(MAN8_TXT))
