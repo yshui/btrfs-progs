@@ -10,26 +10,42 @@ DATA STRUCTURES AND DEFINITIONS
 -------------------------------
 
 [verse]
-'struct btrfs_ioctl_vol_args' {
+struct btrfs_ioctl_vol_args {
 	__s64 fd;
 	char name[BTRFS_PATH_NAME_MAX + 1];
 };
 
 [verse]
-'BTRFS_PATH_NAME_MAX' = 4087
+struct btrfs_ioctl_vol_args_v2 {
+	\__s64 fd;
+	\__u64 transid;
+	\__u64 flags;
+	union {
+		struct {
+			\__u64 size;
+			struct btrfs_qgroup_inherit \__user *qgroup_inherit;
+		};
+		__u64 unused[4];
+	};
+	char name[BTRFS_SUBVOL_NAME_MAX + 1];
+};
+
+[verse]
+BTRFS_SUBVOL_NAME_MAX = 4039
+BTRFS_PATH_NAME_MAX = 4087
 
 LIST OF IOCTLS
 --------------
 
- BTRFS_IOC_SUBVOL_CREATE - (obsolete) create a subvolume
+ BTRFS_IOC_SUBVOL_CREATE -- (obsolete) create a subvolume
  BTRFS_IOC_SNAP_CREATE
  BTRFS_IOC_DEFRAG
  BTRFS_IOC_RESIZE
  BTRFS_IOC_SCAN_DEV
- BTRFS_IOC_TRANS_START 
- BTRFS_IOC_TRANS_END   
- BTRFS_IOC_SYNC        
- BTRFS_IOC_CLONE       
+ BTRFS_IOC_TRANS_START
+ BTRFS_IOC_TRANS_END
+ BTRFS_IOC_SYNC
+ BTRFS_IOC_CLONE
  BTRFS_IOC_ADD_DEV
  BTRFS_IOC_RM_DEV
  BTRFS_IOC_BALANCE
@@ -43,9 +59,9 @@ LIST OF IOCTLS
  BTRFS_IOC_DEFAULT_SUBVOL
  BTRFS_IOC_SPACE_INFO
  BTRFS_IOC_START_SYNC
- BTRFS_IOC_WAIT_SYNC 
+ BTRFS_IOC_WAIT_SYNC
  BTRFS_IOC_SNAP_CREATE_V2
- BTRFS_IOC_SUBVOL_CREATE_V2
+ BTRFS_IOC_SUBVOL_CREATE_V2 -- create a subvolume
  BTRFS_IOC_SUBVOL_GETFLAGS
  BTRFS_IOC_SUBVOL_SETFLAGS
  BTRFS_IOC_SCRUB
@@ -82,11 +98,34 @@ DETAILED DESCRIPTION
 
 BTRFS_IOC_SUBVOL_CREATE
 ~~~~~~~~~~~~~~~~~~~~~~~
+NOTE: obsoleted by BTRFS_IOC_SUBVOL_CREATE_V2
 
- NOTE: obsoleted by BTRFS_IOC_SUBVOL_CREATE_V2
- argument: struct btrfs_ioctl_vol_args
+Create a subvolume.
 
-Create snapshot
+ioctl fd: file descriptor of the parent directory of the new subvolume +
+argument: struct btrfs_ioctl_vol_args +
+fd: ignored +
+name: name of the subvolume +
+since: 3.0 +
+obsoleted: 4.0
+
+Although the 'name' buffer can be almost 4k, the file size is limited by linux VFS
+to 255 characters and must not contain a slash ('/').
+
+BTRFS_IOC_SUBVOL_CREATE_V2
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+NOTE: obsoletes BTRFS_IOC_SUBVOL_CREATE
+
+ioctl fd: file descriptor of the parent directory of the new subvolume +
+argument: struct btrfs_ioctl_vol_args_v2 +
+fd: ignored +
+transid: ignored +
+flags: ignored +
+size, qgroup_inherit: ... +
+name: name of the subvolume +
+since: 3.0
+
+Create a subvolume, qgroup inheritance can be specified.
 
 AVAILABILITY
 ------------
