@@ -711,8 +711,13 @@ static void read_qgroup_status(struct btrfs_path *path,
 	status_item = btrfs_item_ptr(path->nodes[0], path->slots[0],
 				     struct btrfs_qgroup_status_item);
 	flags = btrfs_qgroup_status_flags(path->nodes[0], status_item);
-	counts->qgroup_inconsist = flags & BTRFS_QGROUP_STATUS_FLAG_INCONSISTENT;
-	counts->rescan_running = flags & BTRFS_QGROUP_STATUS_FLAG_RESCAN;
+	/*
+	 * Since qgroup_inconsist/rescan_running is just one bit,
+	 * assign value directly won't work.
+	 */
+	counts->qgroup_inconsist = !!(flags &
+			BTRFS_QGROUP_STATUS_FLAG_INCONSISTENT);
+	counts->rescan_running = !!(flags & BTRFS_QGROUP_STATUS_FLAG_RESCAN);
 }
 
 static int load_quota_info(struct btrfs_fs_info *info)
@@ -1093,6 +1098,19 @@ int report_qgroups(int all)
 		node = rb_next(node);
 	}
 	return ret;
+}
+
+void free_qgroup_counts(void)
+{
+	struct rb_node *node;
+	struct qgroup_count *c;
+	node = rb_first(&counts.root);
+	while (node) {
+		c = rb_entry(node, struct qgroup_count, rb_node);
+		node = rb_next(node);
+		rb_erase(&c->rb_node, &counts.root);
+		free(c);
+	}
 }
 
 int qgroup_verify_all(struct btrfs_fs_info *info)
