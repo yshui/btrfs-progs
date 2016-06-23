@@ -29,7 +29,7 @@ _btrfs()
 
 	local cmd=${words[1]}
 
-    commands='subvolume filesystem balance device scrub check rescue restore inspect-internal property send receive quota qgroup replace help version'
+    commands='subvolume filesystem balance device scrub check rescue restore inspect-internal property send receive quota qgroup dedupe replace help version'
     commands_subvolume='create delete list snapshot find-new get-default set-default show sync'
     commands_filesystem='defragment sync resize show df label usage'
     commands_balance='start pause cancel resume status'
@@ -40,6 +40,7 @@ _btrfs()
     commands_property='get set list'
     commands_quota='enable disable rescan'
     commands_qgroup='assign remove create destroy show limit'
+    commands_dedupe='enable disable status'
     commands_replace='start status cancel'
 
 	if [[ "$cur" == -* && $cword -le 3 && "$cmd" != "help" ]]; then
@@ -93,6 +94,9 @@ _btrfs()
                 ;;
             qgroup)
                 opts="$commands_qgroup"
+                ;;
+            dedupe)
+                opts="$commands_dedupe"
                 ;;
             replace)
                 opts="$commands_replace"
