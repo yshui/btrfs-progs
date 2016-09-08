@@ -17,9 +17,11 @@
 #ifndef __BTRFS_SEND_DUMP_H__
 #define __BTRFS_SEND_DUMP_H__
 
+#include <linux/limits.h>
+
 struct btrfs_dump_send_args {
-	char *full_subvol_path;
-	char *root_path;
+	char full_subvol_path[PATH_MAX];
+	char root_path[PATH_MAX];
 };
 
 extern struct btrfs_send_ops btrfs_print_send_ops;

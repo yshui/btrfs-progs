@@ -1297,10 +1297,8 @@ int cmd_receive(int argc, char **argv)
 	if (dump) {
 		struct btrfs_dump_send_args dump_args;
 
-		dump_args.root_path = malloc(PATH_MAX);
 		dump_args.root_path[0] = '.';
 		dump_args.root_path[1] = '\0';
-		dump_args.full_subvol_path = malloc(PATH_MAX);
 		dump_args.full_subvol_path[0] = '.';
 		dump_args.full_subvol_path[1] = '\0';
 		ret = btrfs_read_and_process_send_stream(receive_fd,
