@@ -35,12 +35,12 @@
 #include "send-stream.h"
 #include "send-dump.h"
 
-#define path_cat_out_with_error(function_name, out_path, path1, path2, ret) \
-ret = path_cat_out(out_path, path1, path2);			\
-if (ret < 0) {							\
-	error("%s: path invalid: %s\n", function_name, path2);	\
-	return ret;						\
-}
+#define PATH_CAT_OR_RET(function_name, out_path, path1, path2, ret)	\
+	ret = path_cat_out((out_path), (path1), (path2));			\
+	if (ret < 0) {							\
+		error("%s: path invalid: %s", function_name, (path2));	\
+		return ret;						\
+	}
 
 #define TITLE_WIDTH	16
 #define PATH_WIDTH	32
@@ -72,7 +72,7 @@ static int print_subvol(const char *path, const u8 *uuid, u64 ctransid,
 	char uuid_str[BTRFS_UUID_UNPARSED_SIZE];
 	int ret;
 
-	path_cat_out_with_error("subvol", r->full_subvol_path, r->root_path,
+	PATH_CAT_OR_RET("subvol", r->full_subvol_path, r->root_path,
 				path, ret);
 	uuid_unparse(uuid, uuid_str);
 
@@ -90,7 +90,7 @@ static int print_snapshot(const char *path, const u8 *uuid, u64 ctransid,
 	char parent_uuid_str[BTRFS_UUID_UNPARSED_SIZE];
 	int ret;
 
-	path_cat_out_with_error("snapshot", r->full_subvol_path, r->root_path,
+	PATH_CAT_OR_RET("snapshot", r->full_subvol_path, r->root_path,
 				path, ret);
 	uuid_unparse(uuid, uuid_str);
 	uuid_unparse(parent_uuid, parent_uuid_str);
@@ -107,7 +107,7 @@ static int print_mkfile(const char *path, void *user)
 	char full_path[PATH_MAX];
 	int ret;
 
-	path_cat_out_with_error("mkfile", full_path, r->full_subvol_path, path,
+	PATH_CAT_OR_RET("mkfile", full_path, r->full_subvol_path, path,
 				ret);
 	print_dump("mkfile", full_path, "");
 	return 0;
@@ -119,7 +119,7 @@ static int print_mkdir(const char *path, void *user)
 	char full_path[PATH_MAX];
 	int ret;
 
-	path_cat_out_with_error("mkdir", full_path, r->full_subvol_path, path,
+	PATH_CAT_OR_RET("mkdir", full_path, r->full_subvol_path, path,
 				ret);
 	print_dump("mkdir", full_path, "");
 	return 0;
@@ -131,7 +131,7 @@ static int print_mknod(const char *path, u64 mode, u64 dev, void *user)
 	char full_path[PATH_MAX];
 	int ret;
 
-	path_cat_out_with_error("mkdir", full_path, r->full_subvol_path, path,
+	PATH_CAT_OR_RET("mkdir", full_path, r->full_subvol_path, path,
 				ret);
 	print_dump("mknod", full_path, "mode: %llo, dev: 0x%llx", mode, dev);
 	return 0;
@@ -143,7 +143,7 @@ static int print_mkfifo(const char *path, void *user)
 	char full_path[PATH_MAX];
 	int ret;
 
-	path_cat_out_with_error("mkfifo", full_path, r->full_subvol_path, path,
+	PATH_CAT_OR_RET("mkfifo", full_path, r->full_subvol_path, path,
 				ret);
 	print_dump("mkfifo", full_path, "");
 	return 0;
@@ -155,7 +155,7 @@ static int print_mksock(const char *path, void *user)
 	char full_path[PATH_MAX];
 	int ret;
 
-	path_cat_out_with_error("mksock", full_path, r->full_subvol_path, path,
+	PATH_CAT_OR_RET("mksock", full_path, r->full_subvol_path, path,
 				ret);
 	print_dump("mksock", full_path, "");
 	return 0;
@@ -167,7 +167,7 @@ static int print_symlink(const char *path, const char *lnk, void *user)
 	char full_path[PATH_MAX];
 	int ret;
 
-	path_cat_out_with_error("symlink", full_path, r->full_subvol_path, path,
+	PATH_CAT_OR_RET("symlink", full_path, r->full_subvol_path, path,
 				ret);
 	print_dump("symlink", full_path, "lnk: %s", lnk);
 	return 0;
@@ -180,9 +180,9 @@ static int print_rename(const char *from, const char *to, void *user)
 	char full_to[PATH_MAX];
 	int ret;
 
-	path_cat_out_with_error("rename", full_from, r->full_subvol_path, from,
+	PATH_CAT_OR_RET("rename", full_from, r->full_subvol_path, from,
 				ret);
-	path_cat_out_with_error("rename", full_to, r->full_subvol_path, to,
+	PATH_CAT_OR_RET("rename", full_to, r->full_subvol_path, to,
 				ret);
 	print_dump("rename", full_from, "to %s", full_to);
 	return 0;
@@ -194,7 +194,7 @@ static int print_link(const char *path, const char *lnk, void *user)
 	char full_path[PATH_MAX];
 	int ret;
 
-	path_cat_out_with_error("link", full_path, r->full_subvol_path, path,
+	PATH_CAT_OR_RET("link", full_path, r->full_subvol_path, path,
 				ret);
 	print_dump("link", full_path, "lnk: %s", lnk);
 	return 0;
@@ -206,7 +206,7 @@ static int print_unlink(const char *path, void *user)
 	char full_path[PATH_MAX];
 	int ret;
 
-	path_cat_out_with_error("unlink", full_path, r->full_subvol_path, path,
+	PATH_CAT_OR_RET("unlink", full_path, r->full_subvol_path, path,
 				ret);
 	print_dump("unlink", full_path, "");
 	return 0;
@@ -218,7 +218,7 @@ static int print_rmdir(const char *path, void *user)
 	char full_path[PATH_MAX];
 	int ret;
 
-	path_cat_out_with_error("rmdir", full_path, r->full_subvol_path, path,
+	PATH_CAT_OR_RET("rmdir", full_path, r->full_subvol_path, path,
 				ret);
 	print_dump("rmdir", full_path, "");
 	return 0;
@@ -231,7 +231,7 @@ static int print_write(const char *path, const void *data, u64 offset,
 	char full_path[PATH_MAX];
 	int ret;
 
-	path_cat_out_with_error("write", full_path, r->full_subvol_path, path,
+	PATH_CAT_OR_RET("write", full_path, r->full_subvol_path, path,
 				ret);
 	print_dump("write", full_path, "offset: %llu, len: %llu", offset, len);
 	return 0;
@@ -246,7 +246,7 @@ static int print_clone(const char *path, u64 offset, u64 len,
 	char full_path[PATH_MAX];
 	int ret;
 
-	path_cat_out_with_error("clone", full_path, r->full_subvol_path, path,
+	PATH_CAT_OR_RET("clone", full_path, r->full_subvol_path, path,
 				ret);
 	print_dump("clone", full_path, "offset: %llu, len: %llu from: %s, offset: %llu",
 		   offset, len, clone_path, clone_offset);
@@ -260,7 +260,7 @@ static int print_set_xattr(const char *path, const char *name,
 	char full_path[PATH_MAX];
 	int ret;
 
-	path_cat_out_with_error("set_xattr", full_path, r->full_subvol_path,
+	PATH_CAT_OR_RET("set_xattr", full_path, r->full_subvol_path,
 				path, ret);
 	print_dump("set_xattr", full_path, "name: %s, len: %s", name, len);
 	return 0;
@@ -272,7 +272,7 @@ static int print_remove_xattr(const char *path, const char *name, void *user)
 	char full_path[PATH_MAX];
 	int ret;
 
-	path_cat_out_with_error("remove_xattr", full_path, r->full_subvol_path,
+	PATH_CAT_OR_RET("remove_xattr", full_path, r->full_subvol_path,
 				path, ret);
 	print_dump("remove_xattr", full_path, name);
 	return 0;
@@ -284,7 +284,7 @@ static int print_truncate(const char *path, u64 size, void *user)
 	char full_path[PATH_MAX];
 	int ret;
 
-	path_cat_out_with_error("truncate", full_path, r->full_subvol_path,
+	PATH_CAT_OR_RET("truncate", full_path, r->full_subvol_path,
 				path, ret);
 	print_dump("truncate", full_path, "size: %llu", size);
 	return 0;
@@ -296,7 +296,7 @@ static int print_chmod(const char *path, u64 mode, void *user)
 	char full_path[PATH_MAX];
 	int ret;
 
-	path_cat_out_with_error("chmod", full_path, r->full_subvol_path, path,
+	PATH_CAT_OR_RET("chmod", full_path, r->full_subvol_path, path,
 				ret);
 	print_dump("chmod", full_path, "mode: %llo", mode);
 	return 0;
@@ -308,7 +308,7 @@ static int print_chown(const char *path, u64 uid, u64 gid, void *user)
 	char full_path[PATH_MAX];
 	int ret;
 
-	path_cat_out_with_error("chown", full_path, r->full_subvol_path, path,
+	PATH_CAT_OR_RET("chown", full_path, r->full_subvol_path, path,
 				ret);
 	print_dump("chown", full_path, "gid: %llu, uid: %llu", gid, uid);
 	return 0;
@@ -322,7 +322,7 @@ static int print_utimes(const char *path, struct timespec *at,
 	char full_path[PATH_MAX];
 	int ret;
 
-	path_cat_out_with_error("utimes", full_path, r->full_subvol_path, path,
+	PATH_CAT_OR_RET("utimes", full_path, r->full_subvol_path, path,
 				ret);
 	print_dump("utimes", full_path, "");
 	return 0;
@@ -335,7 +335,7 @@ static int print_update_extent(const char *path, u64 offset, u64 len,
 	char full_path[PATH_MAX];
 	int ret;
 
-	path_cat_out_with_error("update_extent", full_path, r->full_subvol_path,
+	PATH_CAT_OR_RET("update_extent", full_path, r->full_subvol_path,
 				path, ret);
 	print_dump("update_extent", full_path, "offset: %llu, len: %llu",
 		   offset, len);
