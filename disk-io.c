@@ -123,7 +123,7 @@ u32 btrfs_csum_data(struct btrfs_root *root, char *data, u32 seed, size_t len)
 	return crc32c(seed, data, len);
 }
 
-void btrfs_csum_final(u32 crc, char *result)
+void btrfs_csum_final(u32 crc, u8 *result)
 {
 	put_unaligned_le32(~crc, result);
 }
@@ -131,7 +131,7 @@ void btrfs_csum_final(u32 crc, char *result)
 static int __csum_tree_block_size(struct extent_buffer *buf, u16 csum_size,
 				  int verify, int silent)
 {
-	char result[BTRFS_CSUM_SIZE];
+	u8 result[BTRFS_CSUM_SIZE];
 	u32 len;
 	u32 crc = ~(u32)0;
 
@@ -739,7 +739,11 @@ struct btrfs_root *btrfs_read_fs_root_no_cache(struct btrfs_fs_info *fs_info,
 		     root, fs_info, location->objectid);
 
 	path = btrfs_alloc_path();
-	BUG_ON(!path);
+	if (!path) {
+		free(root);
+		return ERR_PTR(-ENOMEM);
+	}
+
 	ret = btrfs_search_slot(NULL, tree_root, location, path, 0, 0);
 	if (ret != 0) {
 		if (ret > 0)
@@ -1407,7 +1411,11 @@ struct btrfs_root *open_ctree_fd(int fp, const char *path, u64 sb_bytenr,
 	struct btrfs_fs_info *info;
 
 	/* This flags may not return fs_info with any valid root */
-	BUG_ON(flags & OPEN_CTREE_IGNORE_CHUNK_TREE_ERROR);
+	if (flags & OPEN_CTREE_IGNORE_CHUNK_TREE_ERROR) {
+		error("invalid open_ctree flags: 0x%llx",
+				(unsigned long long)flags);
+		return NULL;
+	}
 	info = __open_ctree_fd(fp, path, sb_bytenr, 0, 0, flags);
 	if (!info)
 		return NULL;
@@ -1425,7 +1433,7 @@ struct btrfs_root *open_ctree_fd(int fp, const char *path, u64 sb_bytenr,
  */
 static int check_super(struct btrfs_super_block *sb, unsigned sbflags)
 {
-	char result[BTRFS_CSUM_SIZE];
+	u8 result[BTRFS_CSUM_SIZE];
 	u32 crc;
 	u16 csum_type;
 	int csum_size;
@@ -1649,7 +1657,7 @@ static int write_dev_supers(struct btrfs_root *root,
 		crc = ~(u32)0;
 		crc = btrfs_csum_data(NULL, (char *)sb + BTRFS_CSUM_SIZE, crc,
 				      BTRFS_SUPER_INFO_SIZE - BTRFS_CSUM_SIZE);
-		btrfs_csum_final(crc, (char *)&sb->csum[0]);
+		btrfs_csum_final(crc, &sb->csum[0]);
 
 		/*
 		 * super_copy is BTRFS_SUPER_INFO_SIZE bytes and is
@@ -1673,7 +1681,7 @@ static int write_dev_supers(struct btrfs_root *root,
 		crc = ~(u32)0;
 		crc = btrfs_csum_data(NULL, (char *)sb + BTRFS_CSUM_SIZE, crc,
 				      BTRFS_SUPER_INFO_SIZE - BTRFS_CSUM_SIZE);
-		btrfs_csum_final(crc, (char *)&sb->csum[0]);
+		btrfs_csum_final(crc, &sb->csum[0]);
 
 		/*
 		 * super_copy is BTRFS_SUPER_INFO_SIZE bytes and is

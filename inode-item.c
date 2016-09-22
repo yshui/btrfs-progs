@@ -64,7 +64,7 @@ int btrfs_insert_inode_ref(struct btrfs_trans_handle *trans,
 
 	key.objectid = inode_objectid;
 	key.offset = ref_objectid;
-	btrfs_set_key_type(&key, BTRFS_INODE_REF_KEY);
+	key.type = BTRFS_INODE_REF_KEY;
 
 	path = btrfs_alloc_path();
 	if (!path)
@@ -128,13 +128,13 @@ int btrfs_lookup_inode(struct btrfs_trans_handle *trans, struct btrfs_root
 	struct btrfs_key found_key;
 
 	ret = btrfs_search_slot(trans, root, location, path, ins_len, cow);
-	if (ret > 0 && btrfs_key_type(location) == BTRFS_ROOT_ITEM_KEY &&
+	if (ret > 0 && location->type == BTRFS_ROOT_ITEM_KEY &&
 	    location->offset == (u64)-1 && path->slots[0] != 0) {
 		slot = path->slots[0] - 1;
 		leaf = path->nodes[0];
 		btrfs_item_key_to_cpu(leaf, &found_key, slot);
 		if (found_key.objectid == location->objectid &&
-		    btrfs_key_type(&found_key) == btrfs_key_type(location)) {
+		    found_key.type == location->type) {
 			path->slots[0]--;
 			return 0;
 		}

@@ -192,7 +192,7 @@ static int reserve_free_space(struct cache_tree *free_tree, u64 len,
 	struct cache_extent *cache;
 	int found = 0;
 
-	BUG_ON(!ret_start);
+	ASSERT(ret_start != NULL);
 	cache = first_cache_extent(free_tree);
 	while (cache) {
 		if (cache->size > len) {
@@ -223,7 +223,7 @@ static inline int write_temp_super(int fd, struct btrfs_super_block *sb,
 
 	crc = btrfs_csum_data(NULL, (char *)sb + BTRFS_CSUM_SIZE, crc,
 			      BTRFS_SUPER_INFO_SIZE - BTRFS_CSUM_SIZE);
-	btrfs_csum_final(crc, (char *)&sb->csum[0]);
+	btrfs_csum_final(crc, &sb->csum[0]);
 	ret = pwrite(fd, sb, BTRFS_SUPER_INFO_SIZE, sb_bytenr);
 	if (ret < BTRFS_SUPER_INFO_SIZE)
 		ret = (ret < 0 ? -errno : -EIO);
@@ -405,8 +405,23 @@ static int setup_temp_root_tree(int fd, struct btrfs_mkfs_config *cfg,
 	 * Provided bytenr must in ascending order, or tree root will have a
 	 * bad key order.
 	 */
-	BUG_ON(!(root_bytenr < extent_bytenr && extent_bytenr < dev_bytenr &&
-		 dev_bytenr < fs_bytenr && fs_bytenr < csum_bytenr));
+	if (!(root_bytenr < extent_bytenr && extent_bytenr < dev_bytenr &&
+	      dev_bytenr < fs_bytenr && fs_bytenr < csum_bytenr)) {
+		error("bad tree bytenr order: "
+				"root < extent %llu < %llu, "
+				"extent < dev %llu < %llu, "
+				"dev < fs %llu < %llu, "
+				"fs < csum %llu < %llu",
+				(unsigned long long)root_bytenr,
+				(unsigned long long)extent_bytenr,
+				(unsigned long long)extent_bytenr,
+				(unsigned long long)dev_bytenr,
+				(unsigned long long)dev_bytenr,
+				(unsigned long long)fs_bytenr,
+				(unsigned long long)fs_bytenr,
+				(unsigned long long)csum_bytenr);
+		return -EINVAL;
+	}
 	buf = malloc(sizeof(*buf) + cfg->nodesize);
 	if (!buf)
 		return -ENOMEM;
@@ -567,7 +582,12 @@ static int setup_temp_chunk_tree(int fd, struct btrfs_mkfs_config *cfg,
 	int ret;
 
 	/* Must ensure SYS chunk starts before META chunk */
-	BUG_ON(meta_chunk_start < sys_chunk_start);
+	if (meta_chunk_start < sys_chunk_start) {
+		error("wrong chunk order: meta < system %llu < %llu",
+				(unsigned long long)meta_chunk_start,
+				(unsigned long long)sys_chunk_start);
+		return -EINVAL;
+	}
 	buf = malloc(sizeof(*buf) + cfg->nodesize);
 	if (!buf)
 		return -ENOMEM;
@@ -633,7 +653,12 @@ static int setup_temp_dev_tree(int fd, struct btrfs_mkfs_config *cfg,
 	int ret;
 
 	/* Must ensure SYS chunk starts before META chunk */
-	BUG_ON(meta_chunk_start < sys_chunk_start);
+	if (meta_chunk_start < sys_chunk_start) {
+		error("wrong chunk order: meta < system %llu < %llu",
+				(unsigned long long)meta_chunk_start,
+				(unsigned long long)sys_chunk_start);
+		return -EINVAL;
+	}
 	buf = malloc(sizeof(*buf) + cfg->nodesize);
 	if (!buf)
 		return -ENOMEM;
@@ -829,9 +854,27 @@ static int setup_temp_extent_tree(int fd, struct btrfs_mkfs_config *cfg,
 	 * We must ensure provided bytenr are in ascending order,
 	 * or extent tree key order will be broken.
 	 */
-	BUG_ON(!(chunk_bytenr < root_bytenr && root_bytenr < extent_bytenr &&
-		 extent_bytenr < dev_bytenr && dev_bytenr < fs_bytenr &&
-		 fs_bytenr < csum_bytenr));
+	if (!(chunk_bytenr < root_bytenr && root_bytenr < extent_bytenr &&
+	      extent_bytenr < dev_bytenr && dev_bytenr < fs_bytenr &&
+	      fs_bytenr < csum_bytenr)) {
+		error("bad tree bytenr order: "
+				"chunk < root %llu < %llu, "
+				"root < extent %llu < %llu, "
+				"extent < dev %llu < %llu, "
+				"dev < fs %llu < %llu, "
+				"fs < csum %llu < %llu",
+				(unsigned long long)chunk_bytenr,
+				(unsigned long long)root_bytenr,
+				(unsigned long long)root_bytenr,
+				(unsigned long long)extent_bytenr,
+				(unsigned long long)extent_bytenr,
+				(unsigned long long)dev_bytenr,
+				(unsigned long long)dev_bytenr,
+				(unsigned long long)fs_bytenr,
+				(unsigned long long)fs_bytenr,
+				(unsigned long long)csum_bytenr);
+		return -EINVAL;
+	}
 	buf = malloc(sizeof(*buf) + cfg->nodesize);
 	if (!buf)
 		return -ENOMEM;
@@ -1176,8 +1219,21 @@ int make_btrfs(int fd, struct btrfs_mkfs_config *cfg,
 		if (!skinny_metadata)
 			item_size += sizeof(struct btrfs_tree_block_info);
 
-		BUG_ON(cfg->blocks[i] < first_free);
-		BUG_ON(cfg->blocks[i] < cfg->blocks[i - 1]);
+		if (cfg->blocks[i] < first_free) {
+			error("block[%d] below first free: %llu < %llu",
+					i, (unsigned long long)cfg->blocks[i],
+					(unsigned long long)first_free);
+			ret = -EINVAL;
+			goto out;
+		}
+		if (cfg->blocks[i] < cfg->blocks[i - 1]) {
+			error("blocks %d and %d in reverse order: %llu < %llu",
+				i, i - 1,
+				(unsigned long long)cfg->blocks[i],
+				(unsigned long long)cfg->blocks[i - 1]);
+			ret = -EINVAL;
+			goto out;
+		}
 
 		/* create extent item */
 		itemoff -= item_size;
@@ -1377,7 +1433,6 @@ int make_btrfs(int fd, struct btrfs_mkfs_config *cfg,
 	}
 
 	/* and write out the super block */
-	BUG_ON(sizeof(super) > cfg->sectorsize);
 	memset(buf->data, 0, BTRFS_SUPER_INFO_SIZE);
 	memcpy(buf->data, &super, sizeof(super));
 	buf->len = BTRFS_SUPER_INFO_SIZE;
@@ -1566,13 +1621,16 @@ int btrfs_add_to_fsid(struct btrfs_trans_handle *trans,
 
 	device_total_bytes = (device_total_bytes / sectorsize) * sectorsize;
 
-	device = kzalloc(sizeof(*device), GFP_NOFS);
-	if (!device)
-		goto err_nomem;
-	buf = kzalloc(sectorsize, GFP_NOFS);
-	if (!buf)
-		goto err_nomem;
-	BUG_ON(sizeof(*disk_super) > sectorsize);
+	device = calloc(1, sizeof(*device));
+	if (!device) {
+		ret = -ENOMEM;
+		goto out;
+	}
+	buf = calloc(1, sectorsize);
+	if (!buf) {
+		ret = -ENOMEM;
+		goto out;
+	}
 
 	disk_super = (struct btrfs_super_block *)buf;
 	dev_item = &disk_super->dev_item;
@@ -1590,12 +1648,15 @@ int btrfs_add_to_fsid(struct btrfs_trans_handle *trans,
 	device->total_ios = 0;
 	device->dev_root = root->fs_info->dev_root;
 	device->name = strdup(path);
-	if (!device->name)
-		goto err_nomem;
+	if (!device->name) {
+		ret = -ENOMEM;
+		goto out;
+	}
 
 	INIT_LIST_HEAD(&device->dev_list);
 	ret = btrfs_add_device(trans, root, device);
-	BUG_ON(ret);
+	if (ret)
+		goto out;
 
 	fs_total_bytes = btrfs_super_total_bytes(super) + device_total_bytes;
 	btrfs_set_super_total_bytes(super, fs_total_bytes);
@@ -1618,15 +1679,15 @@ int btrfs_add_to_fsid(struct btrfs_trans_handle *trans,
 	ret = pwrite(fd, buf, sectorsize, BTRFS_SUPER_INFO_OFFSET);
 	BUG_ON(ret != sectorsize);
 
-	kfree(buf);
+	free(buf);
 	list_add(&device->dev_list, &root->fs_info->fs_devices->devices);
 	device->fs_devices = root->fs_info->fs_devices;
 	return 0;
 
-err_nomem:
-	kfree(device);
-	kfree(buf);
-	return -ENOMEM;
+out:
+	free(device);
+	free(buf);
+	return ret;
 }
 
 static int btrfs_wipe_existing_sb(int fd)

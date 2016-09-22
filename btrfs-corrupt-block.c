@@ -65,7 +65,7 @@ static int debug_corrupt_block(struct extent_buffer *eb,
 			"mirror %d logical %llu physical %llu device %s\n",
 			mirror_num, (unsigned long long)bytenr,
 			(unsigned long long)eb->dev_bytenr, device->name);
-		kfree(multi);
+		free(multi);
 
 		if (!copy || mirror_num == copy) {
 			ret = read_extent_from_disk(eb, 0, eb->len);
@@ -899,7 +899,11 @@ static int corrupt_item_nocow(struct btrfs_trans_handle *trans,
 	if (slot == 0)
 		del = 0;
 	/* Only accept valid eb */
-	BUG_ON(!leaf->data || slot >= btrfs_header_nritems(leaf));
+	if (slot >= btrfs_header_nritems(leaf)) {
+		error("invalid eb: no data or slot out of range: %d >= %d",
+				slot, btrfs_header_nritems(leaf));
+		return -EINVAL;
+	}
 	btrfs_item_key_to_cpu(leaf, &key, slot);
 	if (del) {
 		fprintf(stdout, "Deleting key and data [%llu, %u, %llu].\n",

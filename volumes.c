@@ -367,7 +367,7 @@ no_more_items:
 				goto check_pending;
 			}
 		}
-		if (btrfs_key_type(&key) != BTRFS_DEV_EXTENT_KEY) {
+		if (key.type != BTRFS_DEV_EXTENT_KEY) {
 			goto next;
 		}
 
@@ -459,7 +459,8 @@ static int find_next_chunk(struct btrfs_root *root, u64 objectid, u64 *offset)
 	struct btrfs_key found_key;
 
 	path = btrfs_alloc_path();
-	BUG_ON(!path);
+	if (!path)
+		return -ENOMEM;
 
 	key.objectid = objectid;
 	key.offset = (u64)-1;
@@ -740,7 +741,7 @@ static int btrfs_device_avail_bytes(struct btrfs_trans_handle *trans,
 			goto next;
 		if (key.objectid > device->devid)
 			break;
-		if (btrfs_key_type(&key) != BTRFS_DEV_EXTENT_KEY)
+		if (key.type != BTRFS_DEV_EXTENT_KEY)
 			goto next;
 		if (key.offset > search_end)
 			break;
@@ -1069,7 +1070,11 @@ int btrfs_alloc_data_chunk(struct btrfs_trans_handle *trans,
 	key.objectid = BTRFS_FIRST_CHUNK_TREE_OBJECTID;
 	key.type = BTRFS_CHUNK_ITEM_KEY;
 	if (convert) {
-		BUG_ON(*start != round_down(*start, extent_root->sectorsize));
+		if (*start != round_down(*start, extent_root->sectorsize)) {
+			error("DATA chunk start not sectorsize aligned: %llu",
+					(unsigned long long)*start);
+			return -EINVAL;
+		}
 		key.offset = *start;
 		dev_offset = *start;
 	} else {

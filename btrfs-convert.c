@@ -424,8 +424,16 @@ static int create_image_file_range(struct btrfs_trans_handle *trans,
 	int i;
 	int ret;
 
-	BUG_ON(bytenr != round_down(bytenr, root->sectorsize));
-	BUG_ON(len != round_down(len, root->sectorsize));
+	if (bytenr != round_down(bytenr, root->sectorsize)) {
+		error("bytenr not sectorsize aligned: %llu",
+				(unsigned long long)bytenr);
+		return -EINVAL;
+	}
+	if (len != round_down(len, root->sectorsize)) {
+		error("length not sectorsize aligned: %llu",
+				(unsigned long long)len);
+		return -EINVAL;
+	}
 	len = min_t(u64, len, BTRFS_MAX_EXTENT_SIZE);
 
 	/*
@@ -514,7 +522,11 @@ static int create_image_file_range(struct btrfs_trans_handle *trans,
 			    bg_cache->key.offset - bytenr);
 	}
 
-	BUG_ON(len != round_down(len, root->sectorsize));
+	if (len != round_down(len, root->sectorsize)) {
+		error("remaining length not sectorsize aligned: %llu",
+				(unsigned long long)len);
+		return -EINVAL;
+	}
 	ret = btrfs_record_file_extent(trans, root, ino, inode, bytenr,
 				       disk_bytenr, len);
 	if (ret < 0)
@@ -2171,6 +2183,17 @@ static void ext2_copy_inode_item(struct btrfs_inode_item *dst,
 	}
 	memset(&dst->reserved, 0, sizeof(dst->reserved));
 }
+static int check_filesystem_state(struct btrfs_convert_context *cctx)
+{
+	ext2_filsys fs = cctx->fs_data;
+
+        if (!(fs->super->s_state & EXT2_VALID_FS))
+		return 1;
+	else if (fs->super->s_state & EXT2_ERROR_FS)
+		return 1;
+	else
+		return 0;
+}
 
 /*
  * copy a single inode. do all the required works, such as cloning
@@ -2340,6 +2363,10 @@ static int do_convert(const char *devname, int datacsum, int packing,
 	ret = convert_open_fs(devname, &cctx);
 	if (ret)
 		goto fail;
+	ret = check_filesystem_state(&cctx);
+	if (ret)
+		warning(
+		"source filesystem is not clean, running fsck is recommended");
 	ret = convert_read_used_space(&cctx);
 	if (ret)
 		goto fail;
@@ -2586,7 +2613,7 @@ static int may_rollback(struct btrfs_root *root)
 
 		num_stripes = multi->num_stripes;
 		physical = multi->stripes[0].physical;
-		kfree(multi);
+		free(multi);
 
 		if (num_stripes != 1) {
 			error("num stripes for bytenr %llu is not 1", bytenr);
@@ -2727,7 +2754,7 @@ static int do_rollback(const char *devname)
 
 	key.objectid = objectid;
 	key.offset = 0;
-	btrfs_set_key_type(&key, BTRFS_EXTENT_DATA_KEY);
+	key.type = BTRFS_EXTENT_DATA_KEY;
 	ret = btrfs_search_slot(NULL, image_root, &key, &path, 0, 0);
 	if (ret != 0) {
 		error("unable to find first file extent: %d", ret);
@@ -2747,7 +2774,7 @@ static int do_rollback(const char *devname)
 
 		btrfs_item_key_to_cpu(leaf, &key, path.slots[0]);
 		if (key.objectid != objectid || key.offset != offset ||
-		    btrfs_key_type(&key) != BTRFS_EXTENT_DATA_KEY)
+		    key.type != BTRFS_EXTENT_DATA_KEY)
 			break;
 
 		fi = btrfs_item_ptr(leaf, path.slots[0],
@@ -2810,7 +2837,10 @@ next_extent:
 	/* force no allocation from system block group */
 	root->fs_info->system_allocs = -1;
 	trans = btrfs_start_transaction(root, 1);
-	BUG_ON(!trans);
+	if (!trans) {
+		error("unable to start transaction");
+		goto fail;
+	}
 	/*
 	 * recow the whole chunk tree, this will remove all chunk tree blocks
 	 * from system block group
@@ -2859,7 +2889,10 @@ next_extent:
 	}
 
 	ret = btrfs_commit_transaction(trans, root);
-	BUG_ON(ret);
+	if (ret) {
+		error("transaction commit failed: %d", ret);
+		goto fail;
+	}
 
 	ret = close_ctree(root);
 	if (ret) {

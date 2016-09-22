@@ -659,6 +659,7 @@ static struct inode_record *clone_inode_rec(struct inode_record *orig_rec)
 	struct inode_backref *tmp;
 	struct orphan_data_extent *src_orphan;
 	struct orphan_data_extent *dst_orphan;
+	struct rb_node *rb;
 	size_t size;
 	int ret;
 
@@ -691,9 +692,20 @@ static struct inode_record *clone_inode_rec(struct inode_record *orig_rec)
 		list_add_tail(&dst_orphan->list, &rec->orphan_extents);
 	}
 	ret = copy_file_extent_holes(&rec->holes, &orig_rec->holes);
-	BUG_ON(ret < 0);
+	if (ret < 0)
+		goto cleanup_rb;
 
 	return rec;
+
+cleanup_rb:
+	rb = rb_first(&rec->holes);
+	while (rb) {
+		struct file_extent_hole *hole;
+
+		hole = rb_entry(rb, struct file_extent_hole, node);
+		rb = rb_next(rb);
+		free(hole);
+	}
 
 cleanup:
 	if (!list_empty(&rec->backrefs))
@@ -3210,7 +3222,7 @@ static void free_root_record(struct cache_extent *cache)
 		free(backref);
 	}
 
-	kfree(rec);
+	free(rec);
 }
 
 FREE_EXTENT_CACHE_BASED_TREE(root_recs, free_root_record);
@@ -4643,7 +4655,10 @@ static int add_extent_rec_nolookup(struct cache_tree *extent_cache,
 	rec->cache.start = tmpl->start;
 	rec->cache.size = tmpl->nr;
 	ret = insert_cache_extent(extent_cache, &rec->cache);
-	BUG_ON(ret);
+	if (ret) {
+		free(rec);
+		return ret;
+	}
 	bytes_used += rec->nr;
 
 	if (tmpl->metadata)
@@ -4766,6 +4781,7 @@ static int add_tree_backref(struct cache_tree *extent_cache, u64 bytenr,
 	struct extent_record *rec;
 	struct tree_backref *back;
 	struct cache_extent *cache;
+	int ret;
 
 	cache = lookup_cache_extent(extent_cache, bytenr, 1);
 	if (!cache) {
@@ -4776,7 +4792,9 @@ static int add_tree_backref(struct cache_tree *extent_cache, u64 bytenr,
 		tmpl.nr = 1;
 		tmpl.metadata = 1;
 
-		add_extent_rec_nolookup(extent_cache, &tmpl);
+		ret = add_extent_rec_nolookup(extent_cache, &tmpl);
+		if (ret)
+			return ret;
 
 		/* really a bug in cache_extent implement now */
 		cache = lookup_cache_extent(extent_cache, bytenr, 1);
@@ -4830,6 +4848,7 @@ static int add_data_backref(struct cache_tree *extent_cache, u64 bytenr,
 	struct extent_record *rec;
 	struct data_backref *back;
 	struct cache_extent *cache;
+	int ret;
 
 	cache = lookup_cache_extent(extent_cache, bytenr, 1);
 	if (!cache) {
@@ -4840,7 +4859,9 @@ static int add_data_backref(struct cache_tree *extent_cache, u64 bytenr,
 		tmpl.nr = 1;
 		tmpl.max_size = max_size;
 
-		add_extent_rec_nolookup(extent_cache, &tmpl);
+		ret = add_extent_rec_nolookup(extent_cache, &tmpl);
+		if (ret)
+			return ret;
 
 		cache = lookup_cache_extent(extent_cache, bytenr, 1);
 		if (!cache)
@@ -5474,7 +5495,7 @@ static int check_cache_range(struct btrfs_root *root,
 				continue;
 			if (logical[nr] == offset) {
 				if (stripe_len >= bytes) {
-					kfree(logical);
+					free(logical);
 					return 0;
 				}
 				bytes -= stripe_len;
@@ -5482,7 +5503,7 @@ static int check_cache_range(struct btrfs_root *root,
 			} else if (logical[nr] < offset) {
 				if (logical[nr] + stripe_len >=
 				    offset + bytes) {
-					kfree(logical);
+					free(logical);
 					return 0;
 				}
 				bytes = (offset + bytes) -
@@ -5505,7 +5526,7 @@ static int check_cache_range(struct btrfs_root *root,
 							offset,
 							logical[nr] - offset);
 				if (ret) {
-					kfree(logical);
+					free(logical);
 					return ret;
 				}
 
@@ -5516,7 +5537,7 @@ static int check_cache_range(struct btrfs_root *root,
 			}
 		}
 
-		kfree(logical);
+		free(logical);
 	}
 
 	entry = btrfs_find_free_space(cache->free_space_ctl, offset, bytes);
@@ -5740,7 +5761,7 @@ again:
 
 			csum = btrfs_csum_data(NULL, (char *)data + tmp,
 					       csum, root->sectorsize);
-			btrfs_csum_final(csum, (char *)&csum);
+			btrfs_csum_final(csum, (u8 *)&csum);
 
 			csum_offset = leaf_offset +
 				 tmp / root->sectorsize * csum_size;
@@ -6047,7 +6068,9 @@ static int calc_extent_flag(struct btrfs_root *root,
 
 	cache = lookup_cache_extent(extent_cache, buf->start, 1);
 	/* we have added this extent before */
-	BUG_ON(!cache);
+	if (!cache)
+		return -ENOENT;
+
 	rec = container_of(cache, struct extent_record, cache);
 
 	/*
@@ -8486,7 +8509,7 @@ again:
 	btrfs_init_path(&path);
 	key.offset = 0;
 	key.objectid = 0;
-	btrfs_set_key_type(&key, BTRFS_ROOT_ITEM_KEY);
+	key.type = BTRFS_ROOT_ITEM_KEY;
 	ret = btrfs_search_slot(NULL, root->fs_info->tree_root,
 					&key, &path, 0, 0);
 	if (ret < 0)
@@ -8502,7 +8525,7 @@ again:
 			slot = path.slots[0];
 		}
 		btrfs_item_key_to_cpu(leaf, &found_key, path.slots[0]);
-		if (btrfs_key_type(&found_key) == BTRFS_ROOT_ITEM_KEY) {
+		if (found_key.type == BTRFS_ROOT_ITEM_KEY) {
 			unsigned long offset;
 			u64 last_snapshot;
 
@@ -9184,7 +9207,7 @@ static int check_extent_data_backref(struct btrfs_fs_info *fs_info,
 		btrfs_release_path(&path);
 	}
 	key.objectid = root_id;
-	btrfs_set_key_type(&key, BTRFS_ROOT_ITEM_KEY);
+	key.type = BTRFS_ROOT_ITEM_KEY;
 	key.offset = (u64)-1;
 	btrfs_init_path(&path);
 
@@ -9784,7 +9807,7 @@ static int check_leaf_items(struct btrfs_root *root, struct extent_buffer *eb)
 
 next:
 	btrfs_item_key_to_cpu(eb, &key, slot);
-	type = btrfs_key_type(&key);
+	type = key.type;
 
 	switch (type) {
 	case BTRFS_EXTENT_DATA_KEY:
@@ -11270,8 +11293,8 @@ int cmd_check(int argc, char **argv)
 			case 's':
 				num = arg_strtou64(optarg);
 				if (num >= BTRFS_SUPER_MIRROR_MAX) {
-					fprintf(stderr,
-						"ERROR: super mirror should be less than: %d\n",
+					error(
+					"super mirror should be less than %d",
 						BTRFS_SUPER_MIRROR_MAX);
 					exit(1);
 				}
@@ -11340,7 +11363,7 @@ int cmd_check(int argc, char **argv)
 
 	/* This check is the only reason for --readonly to exist */
 	if (readonly && repair) {
-		fprintf(stderr, "Repair options are not compatible with --readonly\n");
+		error("repair options are not compatible with --readonly");
 		exit(1);
 	}
 
@@ -11348,7 +11371,7 @@ int cmd_check(int argc, char **argv)
 	 * Not supported yet
 	 */
 	if (repair && check_mode == CHECK_MODE_LOWMEM) {
-		error("Low memory mode doesn't support repair yet");
+		error("low memory mode doesn't support repair yet");
 		exit(1);
 	}
 
@@ -11356,10 +11379,10 @@ int cmd_check(int argc, char **argv)
 	cache_tree_init(&root_cache);
 
 	if((ret = check_mounted(argv[optind])) < 0) {
-		fprintf(stderr, "Could not check mount status: %s\n", strerror(-ret));
+		error("could not check mount status: %s", strerror(-ret));
 		goto err_out;
 	} else if(ret) {
-		fprintf(stderr, "%s is currently mounted. Aborting.\n", argv[optind]);
+		error("%s is currently mounted, aborting", argv[optind]);
 		ret = -EBUSY;
 		goto err_out;
 	}
@@ -11371,7 +11394,7 @@ int cmd_check(int argc, char **argv)
 	info = open_ctree_fs_info(argv[optind], bytenr, tree_root_bytenr,
 				  chunk_root_bytenr, ctree_flags);
 	if (!info) {
-		fprintf(stderr, "Couldn't open file system\n");
+		error("cannot open file system");
 		ret = -EIO;
 		goto err_out;
 	}
@@ -11384,14 +11407,14 @@ int cmd_check(int argc, char **argv)
 	 * will make us fail to load log tree when mounting.
 	 */
 	if (repair && btrfs_super_log_root(info->super_copy)) {
-		ret = ask_user("repair mode will force to clear out log tree, Are you sure?");
+		ret = ask_user("repair mode will force to clear out log tree, are you sure?");
 		if (!ret) {
 			ret = 1;
 			goto close_out;
 		}
 		ret = zero_log_tree(root);
 		if (ret) {
-			fprintf(stderr, "fail to zero log tree\n");
+			error("failed to zero log tree: %d", ret);
 			goto close_out;
 		}
 	}
@@ -11416,7 +11439,7 @@ int cmd_check(int argc, char **argv)
 	if (!extent_buffer_uptodate(info->tree_root->node) ||
 	    !extent_buffer_uptodate(info->dev_root->node) ||
 	    !extent_buffer_uptodate(info->chunk_root->node)) {
-		fprintf(stderr, "Critical roots corrupted, unable to fsck the FS\n");
+		error("critical roots corrupted, unable to check the filesystem");
 		ret = -EIO;
 		goto close_out;
 	}
@@ -11426,7 +11449,7 @@ int cmd_check(int argc, char **argv)
 
 		trans = btrfs_start_transaction(info->extent_root, 0);
 		if (IS_ERR(trans)) {
-			fprintf(stderr, "Error starting transaction\n");
+			error("error starting transaction");
 			ret = PTR_ERR(trans);
 			goto close_out;
 		}
@@ -11439,10 +11462,11 @@ int cmd_check(int argc, char **argv)
 		}
 
 		if (init_csum_tree) {
-			fprintf(stderr, "Reinit crc root\n");
+			printf("Reinitialize checksum tree\n");
 			ret = btrfs_fsck_reinit_root(trans, info->csum_root, 0);
 			if (ret) {
-				fprintf(stderr, "crc root initialization failed\n");
+				error("checksum tree initialization failed: %d",
+						ret);
 				ret = -EIO;
 				goto close_out;
 			}
@@ -11450,7 +11474,7 @@ int cmd_check(int argc, char **argv)
 			ret = fill_csum_tree(trans, info->csum_root,
 					     init_extent_tree);
 			if (ret) {
-				fprintf(stderr, "crc refilling failed\n");
+				error("checksum tree refilling failed: %d", ret);
 				return -EIO;
 			}
 		}
@@ -11463,24 +11487,24 @@ int cmd_check(int argc, char **argv)
 			goto close_out;
 	}
 	if (!extent_buffer_uptodate(info->extent_root->node)) {
-		fprintf(stderr, "Critical roots corrupted, unable to fsck the FS\n");
+		error("critical: extent_root, unable to check the filesystem");
 		ret = -EIO;
 		goto close_out;
 	}
 	if (!extent_buffer_uptodate(info->csum_root->node)) {
-		fprintf(stderr, "Checksum root corrupted, rerun with --init-csum-tree option\n");
+		error("critical: csum_root, unable to check the filesystem");
 		ret = -EIO;
 		goto close_out;
 	}
 
 	if (!ctx.progress_enabled)
-		fprintf(stderr, "checking extents\n");
+		printf("checking extents");
 	if (check_mode == CHECK_MODE_LOWMEM)
 		ret = check_chunks_and_extents_v2(root);
 	else
 		ret = check_chunks_and_extents(root);
 	if (ret)
-		fprintf(stderr, "Errors found in extent allocation tree or chunk allocation\n");
+		printf("Errors found in extent allocation tree or chunk allocation");
 
 	ret = repair_root_items(info);
 	if (ret < 0)
@@ -11566,7 +11590,7 @@ int cmd_check(int argc, char **argv)
 	}
 
 	if (!list_empty(&root->fs_info->recow_ebs)) {
-		fprintf(stderr, "Transid errors in file system\n");
+		error("transid errors in file system");
 		ret = 1;
 	}
 out:
