@@ -149,7 +149,7 @@ struct btrfs_ioctl_scrub_args {
 	struct btrfs_scrub_progress progress;	/* out */
 	/* pad to 1k */
 	__u64 unused[(1024-32-sizeof(struct btrfs_scrub_progress))/8];
-};
+} __attribute__((packed));
 BUILD_ASSERT(sizeof(struct btrfs_ioctl_scrub_args) == 1024);
 
 #define BTRFS_IOCTL_DEV_REPLACE_CONT_READING_FROM_SRCDEV_MODE_ALWAYS	0
@@ -160,7 +160,7 @@ struct btrfs_ioctl_dev_replace_start_params {
 						 * above */
 	__u8 srcdev_name[BTRFS_DEVICE_PATH_NAME_MAX + 1];	/* in */
 	__u8 tgtdev_name[BTRFS_DEVICE_PATH_NAME_MAX + 1];	/* in */
-};
+} __attribute__((packed, aligned (8)));
 BUILD_ASSERT(sizeof(struct btrfs_ioctl_dev_replace_start_params) == 2072);
 
 #define BTRFS_IOCTL_DEV_REPLACE_STATE_NEVER_STARTED	0
@@ -175,7 +175,7 @@ struct btrfs_ioctl_dev_replace_status_params {
 	__u64 time_stopped;	/* out, seconds since 1-Jan-1970 */
 	__u64 num_write_errors;	/* out */
 	__u64 num_uncorrectable_read_errors;	/* out */
-};
+} __attribute__((packed));
 BUILD_ASSERT(sizeof(struct btrfs_ioctl_dev_replace_status_params) == 48);
 
 #define BTRFS_IOCTL_DEV_REPLACE_CMD_START			0
@@ -556,7 +556,7 @@ BUILD_ASSERT(sizeof(struct btrfs_ioctl_qgroup_create_args) == 16);
 struct btrfs_ioctl_timespec {
 	__u64 sec;
 	__u32 nsec;
-};
+} __attribute__((packed, aligned (8)));
 
 struct btrfs_ioctl_received_subvol_args {
 	char	uuid[BTRFS_UUID_SIZE];	/* in */
@@ -601,7 +601,7 @@ struct btrfs_ioctl_send_args {
 	__u64 parent_root;		/* in */
 	__u64 flags;			/* in */
 	__u64 reserved[4];		/* in */
-};
+} __attribute__((packed));
 /*
  * Size of structure depends on pointer width, was not caught.  Kernel handles
  * pointer width differences transparently
