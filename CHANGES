@@ -1,3 +1,8 @@
+btrfs-progs-4.8.1 (2016-10-09)
+  * 32bit builds fixed
+  * build without backtrace support fixed
+  * more ioctl tests and scripting
+
 btrfs-progs-4.8 (2016-10-05)
   * error handling improvements all over the place
   * new fuzzed images, test updates
