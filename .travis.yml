@@ -25,7 +25,7 @@ services:
 
 before_install:
 #  - docker build -t lebedevri/btrfs-progs .
-  - docker pull kdave/btrfs-progs:devel
+  - docker pull kdave/btrfs-progs:devel-ci
 
 env:
   global:
