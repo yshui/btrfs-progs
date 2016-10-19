@@ -350,7 +350,9 @@ again:
 		error("cannot map block logical %llu length %llu: %d",
 				(unsigned long long)bytenr,
 				(unsigned long long)length, ret);
-		goto out;
+		free(inbuf);
+		inbuf = calloc(num_bytes+3, 1);
+		goto write_out;
 	}
 	device = multi->stripes[0].dev;
 	dev_fd = device->fd;
@@ -386,6 +388,7 @@ again:
 		goto again;
 
 	if (compress == BTRFS_COMPRESS_NONE) {
+	write_out:
 		while (total < num_bytes) {
 			done = pwrite(fd, inbuf+total, num_bytes-total,
 				      pos+total);
