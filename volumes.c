@@ -1201,7 +1201,7 @@ int btrfs_next_bg(struct btrfs_mapping_tree *map_tree, u64 *logical,
 {
 	struct cache_extent *ce;
 	struct map_lookup *map;
-	u64 cur = *logical;
+	int cur = !!(*logical);
 
 	ce = search_cache_extent(&map_tree->cache_tree, cur);
 
@@ -1217,7 +1217,7 @@ int btrfs_next_bg(struct btrfs_mapping_tree *map_tree, u64 *logical,
 				return -ENOENT;
 		}
 
-		cur = ce->start;
+		cur = 1;
 		map = container_of(ce, struct map_lookup, ce);
 		if (map->type & type) {
 			*logical = ce->start;
